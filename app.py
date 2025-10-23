@@ -5,7 +5,7 @@ import requests
 # ====== ENV ======
 DB = os.getenv("DB_PATH", "store_v2.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "adminlinhdz")
-MAIL_TIMEOUT = int(os.getenv("MAIL72H_TIMEOUT", "4"))  # giữ tổng <5s
+MAIL_TIMEOUT = int(os.getenv("MAIL72H_TIMEOUT", "4"))  # giữ tổng < 5s cho TapHoa
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") in ("1","true","True","yes","YES")
 
 app = Flask(__name__)
@@ -39,19 +39,55 @@ def init_db():
         con.commit()
 init_db()
 
-# ====== Provider adapters (Mail72h-style default) ======
-def provider_product_detail(base_url: str, api_key: str, product_id: int) -> dict:
-    url = f"{base_url.rstrip('/')}/product.php"
-    r = requests.get(url, params={"api_key": api_key, "id": product_id}, timeout=MAIL_TIMEOUT)
+# ====== Provider adapters (Mail72h-style, auto key param) ======
+_KEY_CANDIDATES = ("key", "api_key", "api_keyy")
+
+def _http_get_json(url, params):
+    r = requests.get(url, params=params, timeout=MAIL_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def provider_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
-    url = f"{base_url.rstrip('/')}/buy_product"
-    data = {"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}
+def _http_post_json(url, data):
     r = requests.post(url, data=data, timeout=MAIL_TIMEOUT)
     r.raise_for_status()
     return r.json()
+
+def provider_product_detail(base_url: str, api_key: str, product_id: int) -> dict:
+    """
+    Tự thử lần lượt tham số key: key / api_key / api_keyy cho product.php
+    """
+    url = f"{base_url.rstrip('/')}/product.php"
+    last_err = None
+    for keyname in _KEY_CANDIDATES:
+        try:
+            params = {keyname: api_key, "id": product_id}
+            data = _http_get_json(url, params)
+            # Nếu API trả về lỗi dạng text, cứ để except bên dưới xử lý tiếp candidate khác
+            if isinstance(data, dict) and str(data).lower().find("error") >= 0 and "status" in data and data["status"] != "success":
+                last_err = Exception(f"provider error with {keyname}: {data}")
+                continue
+            return data
+        except Exception as e:
+            last_err = e
+            continue
+    # nếu tất cả đều fail
+    raise Exception(f"product.php refused all key formats: {last_err}")
+
+def provider_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
+    """
+    Tự thử key/api_key/api_keyy cho buy_product (form-data)
+    """
+    url = f"{base_url.rstrip('/')}/buy_product"
+    last_err = None
+    for keyname in _KEY_CANDIDATES:
+        try:
+            data = {"action": "buyProduct", "id": product_id, "amount": amount, keyname: api_key}
+            res = _http_post_json(url, data)
+            return res
+        except Exception as e:
+            last_err = e
+            continue
+    raise Exception(f"buy_product refused all key formats: {last_err}")
 
 # ====== Utilities ======
 def _extract_int(value):
@@ -338,7 +374,7 @@ def admin_bulk_key():
             ok += 1
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-# Admin quick tests
+# ====== Admin quick tests ======
 @app.route("/admin/test/stock")
 def admin_test_stock():
     require_admin()
