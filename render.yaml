@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: taphoa-multi-site-direct-v2
+    name: taphoa-multi-site-direct-v2-diag
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
@@ -9,6 +9,8 @@ services:
       - key: ADMIN_SECRET
         sync: false
       - key: DB_PATH
-        value: store.db
+        value: store_v2.db
       - key: MAIL_TIMEOUT
         value: "4"
+      - key: DEBUG_ERRORS
+        value: "1"
