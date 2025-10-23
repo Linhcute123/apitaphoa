@@ -1,12 +1,12 @@
 
-import os, json, sqlite3
+import os, json, sqlite3, re
 from contextlib import closing
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
 
 DB = os.getenv("DB_PATH", "store.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
-MAIL_TIMEOUT = int(os.getenv("MAIL_TIMEOUT", "4"))  # giây, giữ <5s tổng
+MAIL_TIMEOUT = int(os.getenv("MAIL_TIMEOUT", "4"))  # s, giữ <5s tổng
 
 app = Flask(__name__)
 
@@ -18,14 +18,12 @@ def db():
 
 def init_db():
     with db() as con:
-        # "sites" = mỗi web cung cấp hàng (vd: mail72h, webA, webB)
         con.execute("""
         CREATE TABLE IF NOT EXISTS sites(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT NOT NULL UNIQUE,     -- ví dụ: mail72h
-            base_url TEXT NOT NULL         -- ví dụ: https://mail72h.com/api
+            code TEXT NOT NULL UNIQUE,
+            base_url TEXT NOT NULL
         )""")
-        # mỗi input_key của Tạp Hóa map sang product_id + api_key trên *một site*
         con.execute("""
         CREATE TABLE IF NOT EXISTS keymaps(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,42 +37,73 @@ def init_db():
             FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
         )""")
         con.commit()
-
 init_db()
 
-# -------------- Provider helpers (generic) --------------
+# -------------- Provider helpers (generic: mail72h-style) --------------
 def provider_product_detail(base_url: str, api_key: str, product_id: int) -> dict:
-    """
-    Chuẩn cho kiểu 'mail72h' (GET product.php?api_key=...&id=...).
-    Với web khác, bạn có thể sửa adapter ở đây.
-    """
     url = f"{base_url.rstrip('/')}/product.php"
     r = requests.get(url, params={"api_key": api_key, "id": product_id}, timeout=MAIL_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
 def provider_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
-    """
-    Chuẩn cho kiểu 'mail72h' (POST buy_product).
-    Với web khác, sửa adapter này cho khớp.
-    """
     url = f"{base_url.rstrip('/')}/buy_product"
     data = {"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}
     r = requests.post(url, data=data, timeout=MAIL_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
+# -------------- Utilities --------------
+def _extract_int(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value)
+    m = re.search(r'[-+]?\d[\d,\.]*', s)
+    if not m:
+        return None
+    num = m.group(0).replace('.', '').replace(',', '')
+    try:
+        return int(num)
+    except Exception:
+        return None
+
+def _deep_find_stock(obj):
+    """
+    Quét sâu JSON để tìm trường tồn kho. Trả về số lớn nhất gặp được.
+    Những key có thể gặp: stock, tonkho, kho, remain, available, quantity, qty, so_luong, soluong
+    """
+    keys = {'stock','tonkho','kho','remain','available','quantity','qty','so_luong','soluong','stock_left','left'}
+    best = None
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            if k.lower() in keys:
+                val = _extract_int(v)
+                if val is not None:
+                    best = val if best is None else max(best, val)
+            # tiếp tục quét đệ quy
+            val2 = _deep_find_stock(v)
+            if val2 is not None:
+                best = val2 if best is None else max(best, val2)
+    elif isinstance(obj, list):
+        for it in obj:
+            val2 = _deep_find_stock(it)
+            if val2 is not None:
+                best = val2 if best is None else max(best, val2)
+    return best
+
 # -------------- Admin UI -----------------
-TPL = """
+BASE_TPL = """
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
-<title>Tạp Hóa – Multi Site Direct</title>
+<title>Tạp Hóa – Multi Site Direct (v2)</title>
 <style>
   :root { --b:#111; --g:#f5f5f7; --bd:#ddd; }
   body { font-family: system-ui, Arial; padding:28px; background:#fff; color:#111; }
-  h2 { margin:0 0 12px; }
+  h2 { margin:0 0 14px; }
   h3 { margin:24px 0 8px; }
   .grid { display:grid; gap:12px; }
   .card { border:1px solid var(--bd); border-radius:12px; padding:16px; background:#fff; }
@@ -82,96 +111,69 @@ TPL = """
   input { width:100%; padding:10px 12px; border:1px solid var(--bd); border-radius:10px; outline:none; }
   input:focus { border-color:#333; }
   .row { display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; align-items:end; }
-  .col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; } .col-5 { grid-column: span 5; }
-  .col-6 { grid-column: span 6; } .col-8 { grid-column: span 8; } .col-9 { grid-column: span 9; } .col-12{ grid-column: span 12;}
+  .col-2 { grid-column: span 2; } .col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; } .col-6 { grid-column: span 6; } .col-12 { grid-column: span 12; }
   button { padding:10px 14px; border-radius:10px; border:1px solid #111; background:#111; color:#fff; cursor:pointer; }
   table { width:100%; border-collapse:collapse; }
   th, td { padding:10px 12px; border-bottom:1px solid var(--bd); text-align:left; }
   th { background:#fafafa; }
   code { background:#f3f3f3; padding:2px 6px; border-radius:6px; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .actions form { display:inline }
 </style>
 </head>
 <body>
-  <h2>⚙️ Multi Site (Direct): lấy hàng thẳng từ site nhà cung cấp</h2>
+  <h2>⚙️ Multi Site (Direct) – không buffer, đúng kho từ provider</h2>
 
   <div class="card">
-    <h3>1) Thêm Site (web nhà cung cấp)</h3>
+    <h3>1) Thêm/Update Site</h3>
     <form method="post" action="{{ url_for('admin_add_site') }}?admin_secret={{ asec }}">
       <div class="row">
-        <div class="col-4">
-          <label>Site code (vd: mail72h)</label>
+        <div class="col-3">
+          <label>Site code</label>
           <input class="mono" type="text" name="code" placeholder="mail72h" required>
         </div>
-        <div class="col-8">
+        <div class="col-6">
           <label>Base API URL</label>
           <input class="mono" type="text" name="base_url" placeholder="https://mail72h.com/api" required>
         </div>
-        <div class="col-12"><button>Thêm/Update Site</button></div>
+        <div class="col-3"><button>Save Site</button></div>
       </div>
     </form>
   </div>
 
   <div class="card">
-    <h3>2) Thêm key cho 1 Site</h3>
+    <h3>2) Thêm/Update Key</h3>
     <form method="post" action="{{ url_for('admin_add_key') }}?admin_secret={{ asec }}">
       <div class="row">
-        <div class="col-3">
-          <label>Site</label>
-          <input class="mono" type="text" name="site_code" placeholder="mail72h" required>
-        </div>
-        <div class="col-3">
-          <label>SKU</label>
-          <input class="mono" type="text" name="sku" placeholder="edu24h" required>
-        </div>
-        <div class="col-3">
-          <label>input_key (Tạp Hóa)</label>
-          <input class="mono" type="text" name="input_key" placeholder="key-abc" required>
-        </div>
-        <div class="col-3">
-          <label>product_id</label>
-          <input class="mono" type="number" name="product_id" placeholder="12345" required>
-        </div>
-        <div class="col-6">
-          <label>API key của site (dùng để mua hàng)</label>
-          <input class="mono" type="password" name="provider_api_key" placeholder="paste API key" required>
-        </div>
-        <div class="col-12"><button>Thêm/Update Key</button></div>
+        <div class="col-3"><label>Site</label><input class="mono" type="text" name="site_code" placeholder="mail72h" required></div>
+        <div class="col-3"><label>SKU</label><input class="mono" type="text" name="sku" placeholder="edu24h" required></div>
+        <div class="col-3"><label>input_key</label><input class="mono" type="text" name="input_key" placeholder="key-abc" required></div>
+        <div class="col-3"><label>product_id</label><input class="mono" type="number" name="product_id" placeholder="12345" required></div>
+        <div class="col-6"><label>API key của site</label><input class="mono" type="password" name="provider_api_key" placeholder="paste API key" required></div>
+        <div class="col-3"><button>Save Key</button></div>
       </div>
     </form>
+    <details style="margin-top:12px;">
+      <summary><b>Thêm nhanh nhiều dòng</b> (mỗi dòng: <code>site_code,sku,input_key,product_id,api_key</code>)</summary>
+      <form method="post" action="{{ url_for('admin_bulk_key') }}?admin_secret={{ asec }}">
+        <textarea name="bulk" rows="6" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:10px;font-family:ui-monospace" placeholder="mail72h,edu24h,key-abc,12345,APIKEY...\nmail72h,edu30d,key-xyz,29,APIKEY..."></textarea>
+        <div style="margin-top:8px"><button>Import</button></div>
+      </form>
+    </details>
   </div>
 
   <div class="card">
-    <h3>Danh sách Sites</h3>
+    <h3>Sites</h3>
     <table>
-      <thead><tr><th>ID</th><th>Code</th><th>Base URL</th></tr></thead>
+      <thead><tr><th>ID</th><th>Code</th><th>Base URL</th><th>Actions</th></tr></thead>
       <tbody>
       {% for s in sites %}
-        <tr><td>{{ s['id'] }}</td><td><code>{{ s['code'] }}</code></td><td class="mono">{{ s['base_url'] }}</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h3>Danh sách Key maps</h3>
-    <table>
-      <thead><tr><th>Site</th><th>SKU</th><th>input_key</th><th>product_id</th><th>Active</th><th>Hành động</th></tr></thead>
-      <tbody>
-      {% for m in maps %}
         <tr>
-          <td><code>{{ m['site_code'] }}</code></td>
-          <td>{{ m['sku'] }}</td>
-          <td><code>{{ m['input_key'] }}</code></td>
-          <td>{{ m['product_id'] }}</td>
-          <td>{{ m['is_active'] }}</td>
-          <td>
-            <form method="post" action="{{ url_for('admin_toggle_key', kmid=m['id']) }}?admin_secret={{ asec }}" style="display:inline">
-              <button>{{ 'Disable' if m['is_active'] else 'Enable' }}</button>
-            </form>
-            <form method="post" action="{{ url_for('admin_delete_key', kmid=m['id']) }}?admin_secret={{ asec }}" style="display:inline" onsubmit="return confirm('Xoá key {{m['input_key']}}?')">
-              <button>Xoá</button>
-            </form>
+          <td>{{ s['id'] }}</td>
+          <td><code>{{ s['code'] }}</code></td>
+          <td class="mono">{{ s['base_url'] }}</td>
+          <td class="actions">
+            <form method="post" action="{{ url_for('admin_del_site', site_id=s['id']) }}?admin_secret={{ asec }}" onsubmit="return confirm('Xoá site {{s['code']}}?')"><button>Delete</button></form>
           </td>
         </tr>
       {% endfor %}
@@ -180,12 +182,40 @@ TPL = """
   </div>
 
   <div class="card">
-    <h3>Endpoint cho Tạp Hóa (bắt buộc truyền site)</h3>
+    <h3>Keys</h3>
+    <table>
+      <thead><tr><th>ID</th><th>Site</th><th>SKU</th><th>input_key</th><th>product_id</th><th>Active</th><th>Test</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for m in maps %}
+        <tr>
+          <td>{{ m['id'] }}</td>
+          <td><code>{{ m['site_code'] }}</code></td>
+          <td>{{ m['sku'] }}</td>
+          <td><code>{{ m['input_key'] }}</code></td>
+          <td>{{ m['product_id'] }}</td>
+          <td>{{ m['is_active'] }}</td>
+          <td>
+            <a class="mono" href="{{ url_for('admin_test_stock') }}?admin_secret={{ asec }}&site={{ m['site_code'] }}&key={{ m['input_key'] }}" target="_blank">Test stock</a>
+            &nbsp;|&nbsp;
+            <a class="mono" href="{{ url_for('admin_test_fetch') }}?admin_secret={{ asec }}&site={{ m['site_code'] }}&key={{ m['input_key'] }}&quantity=1" target="_blank">Test fetch</a>
+          </td>
+          <td class="actions">
+            <form method="post" action="{{ url_for('admin_toggle_key', kmid=m['id']) }}?admin_secret={{ asec }}"><button>{{ 'Disable' if m['is_active'] else 'Enable' }}</button></form>
+            <form method="post" action="{{ url_for('admin_del_key', kmid=m['id']) }}?admin_secret={{ asec }}" onsubmit="return confirm('Xoá key {{m['input_key']}}?')"><button>Delete</button></form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Endpoint cho Tạp Hóa</h3>
     <pre class="mono">
-Tồn kho (đọc trực tiếp từ site):
+Tồn kho (đọc trực tiếp từ provider):
   GET /stock?site=&lt;site_code&gt;&key=&lt;input_key&gt;
 
-Lấy hàng (mua trực tiếp từ site):
+Lấy hàng (mua trực tiếp từ provider):
   GET /fetch?site=&lt;site_code&gt;&key=&lt;input_key&gt;&order_id={order_id}&quantity={quantity}
     </pre>
   </div>
@@ -198,6 +228,7 @@ def require_admin():
     if request.args.get("admin_secret") != ADMIN_SECRET:
         abort(403)
 
+# ----- Admin routes -----
 @app.route("/admin")
 def admin_index():
     require_admin()
@@ -208,19 +239,28 @@ def admin_index():
             JOIN sites s ON s.id = k.site_id
             ORDER BY s.code, k.id
         """).fetchall()
-    return render_template_string(TPL, sites=sites, maps=maps, asec=ADMIN_SECRET)
+    return render_template_string(BASE_TPL, sites=sites, maps=maps, asec=ADMIN_SECRET)
 
 @app.route("/admin/site", methods=["POST"])
 def admin_add_site():
     require_admin()
     code = request.form.get("code","").strip()
     base = request.form.get("base_url","").strip()
-    if not code or not base: abort(400)
+    if not code or not base:
+        return ("Missing code/base_url", 400)
     with db() as con:
         con.execute("""
             INSERT INTO sites(code, base_url) VALUES(?,?)
             ON CONFLICT(code) DO UPDATE SET base_url=excluded.base_url
         """, (code, base))
+        con.commit()
+    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
+
+@app.route("/admin/site/<int:site_id>", methods=["POST"])
+def admin_del_site(site_id):
+    require_admin()
+    with db() as con:
+        con.execute("DELETE FROM sites WHERE id=?", (site_id,))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
@@ -232,11 +272,12 @@ def admin_add_key():
     input_key = request.form.get("input_key","").strip()
     product_id = request.form.get("product_id","").strip()
     provider_api_key = request.form.get("provider_api_key","").strip()
-    if not site_code or not sku or not input_key or not product_id.isdigit() or not provider_api_key:
-        abort(400)
+    if not all([site_code, sku, input_key, product_id, provider_api_key]) or not product_id.isdigit():
+        return ("Missing/invalid fields", 400)
     with db() as con:
         s = con.execute("SELECT id FROM sites WHERE code=?", (site_code,)).fetchone()
-        if not s: abort(400)
+        if not s:
+            return ("Site not found", 400)
         con.execute("""
             INSERT INTO keymaps(site_id, sku, input_key, product_id, provider_api_key, is_active)
             VALUES(?,?,?,?,?,1)
@@ -249,26 +290,61 @@ def admin_add_key():
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-@app.route("/admin/key/<int:kmid>/toggle", methods=["POST"])
-def admin_toggle_key(kmid):
-    require_admin()
-    with db() as con:
-        row = con.execute("SELECT is_active FROM keymaps WHERE id=?", (kmid,)).fetchone()
-        if not row: abort(404)
-        newv = 0 if row["is_active"] else 1
-        con.execute("UPDATE keymaps SET is_active=? WHERE id=?", (newv, kmid))
-        con.commit()
-    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
-
 @app.route("/admin/key/<int:kmid>", methods=["POST"])
-def admin_delete_key(kmid):
+def admin_del_key(kmid):
     require_admin()
     with db() as con:
         con.execute("DELETE FROM keymaps WHERE id=?", (kmid,))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-# ---------- Public endpoints (require ?site= & ?key=) -----------
+@app.route("/admin/key/<int:kmid>/toggle", methods=["POST"])
+def admin_toggle_key(kmid):
+    require_admin()
+    with db() as con:
+        row = con.execute("SELECT is_active FROM keymaps WHERE id=?", (kmid,)).fetchone()
+        if not row:
+            return ("Not found", 404)
+        newv = 0 if row["is_active"] else 1
+        con.execute("UPDATE keymaps SET is_active=? WHERE id=?", (newv, kmid))
+        con.commit()
+    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
+
+# Admin quick tests
+@app.route("/admin/test/stock")
+def admin_test_stock():
+    require_admin()
+    site = request.args.get("site","").strip()
+    key = request.args.get("key","").strip()
+    if not site or not key:
+        return jsonify({"status":"error","msg":"missing site/key"}), 400
+    s, km = _resolve_site_key(site, key)
+    if not s: return jsonify({"status":"error","msg":"unknown site"}), 404
+    if not km: return jsonify({"status":"error","msg":"unknown key"}), 404
+    try:
+        raw = provider_product_detail(s["base_url"], km["provider_api_key"], int(km["product_id"]))
+        stock_val = _deep_find_stock(raw)
+        return jsonify({"parsed_stock": stock_val, "raw": raw})
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}), 502
+
+@app.route("/admin/test/fetch")
+def admin_test_fetch():
+    require_admin()
+    site = request.args.get("site","").strip()
+    key = request.args.get("key","").strip()
+    qty_s = request.args.get("quantity","1").strip()
+    qty = int(qty_s) if qty_s.isdigit() else 1
+    s, km = _resolve_site_key(site, key)
+    if not s or not km:
+        return jsonify({"status":"error","msg":"bad site/key"}), 400
+    try:
+        res = provider_buy(s["base_url"], km["provider_api_key"], int(km["product_id"]), qty)
+        return jsonify(res)
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}), 502
+
+# ---------- Public endpoints -----------
 def _resolve_site_key(site_code: str, key: str):
     with db() as con:
         s = con.execute("SELECT * FROM sites WHERE code=?", (site_code,)).fetchone()
@@ -287,13 +363,18 @@ def stock():
     s, km = _resolve_site_key(site, key)
     if not s: return jsonify({"status":"error","msg":"unknown site"}), 404
     if not km: return jsonify({"status":"error","msg":"unknown key for this site"}), 404
-    # đọc kho thật
+
     try:
-        pd = provider_product_detail(s["base_url"], km["provider_api_key"], int(km["product_id"]))
-        stock_val = int(pd.get("data", {}).get("stock", 0))
-    except Exception:
-        stock_val = 9999
-    return jsonify({"sum": stock_val})
+        raw = provider_product_detail(s["base_url"], km["provider_api_key"], int(km["product_id"]))
+        stock_val = _deep_find_stock(raw)
+        if stock_val is None:
+            # fallback để không chặn mua; nhưng có admin test để xem raw rồi chỉnh
+            stock_val = 9999
+        return jsonify({"sum": int(stock_val)})
+    except requests.HTTPError as e:
+        return jsonify({"status":"error","msg":f"http {e.response.status_code}"}), 502
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}), 502
 
 @app.route("/fetch")
 def fetch():
@@ -304,7 +385,7 @@ def fetch():
     if not site or not key or not qty_s:
         return jsonify({"status":"error","msg":"missing site/key/quantity"}), 400
     try:
-        qty = int(qty_s); 
+        qty = int(qty_s)
         if qty<=0 or qty>1000: raise ValueError()
     except Exception:
         return jsonify({"status":"error","msg":"invalid quantity"}), 400

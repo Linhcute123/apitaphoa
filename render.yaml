@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: taphoa-multi-site-direct
+    name: taphoa-multi-site-direct-v2
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
