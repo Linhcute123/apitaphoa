@@ -1,4 +1,3 @@
-# render.yaml
 services:
   - type: web
     name: taphoa-mail72h
@@ -15,5 +14,9 @@ services:
         value: https://mail72h.com/api
       - key: DB_PATH
         value: store.db
-      - key: TIMEOUT
-        value: "25"
+      - key: MAIL72H_TIMEOUT
+        value: "3"
+      - key: LOW_WATERMARK
+        value: "20"
+      - key: TOPUP_BATCH
+        value: "50"
