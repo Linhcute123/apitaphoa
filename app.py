@@ -1,3 +1,4 @@
+
 import os, json, sqlite3, re, traceback
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
@@ -39,8 +40,15 @@ def init_db():
         con.commit()
 init_db()
 
-# ====== Provider adapters (Mail72h-style, auto key param) ======
+# ====== Provider adapters (Mail72h-style, auto key param & /api suffix) ======
 _KEY_CANDIDATES = ("key", "api_key", "api_keyy")
+
+def _bases_to_try(base_url: str):
+    base = base_url.rstrip("/")
+    cands = [base]
+    if not re.search(r"/api/?$", base, re.IGNORECASE):
+        cands.append(base + "/api")
+    return cands
 
 def _http_get_json(url, params):
     r = requests.get(url, params=params, timeout=MAIL_TIMEOUT)
@@ -53,41 +61,32 @@ def _http_post_json(url, data):
     return r.json()
 
 def provider_product_detail(base_url: str, api_key: str, product_id: int) -> dict:
-    """
-    Tự thử lần lượt tham số key: key / api_key / api_keyy cho product.php
-    """
-    url = f"{base_url.rstrip('/')}/product.php"
     last_err = None
-    for keyname in _KEY_CANDIDATES:
-        try:
-            params = {keyname: api_key, "id": product_id}
-            data = _http_get_json(url, params)
-            # Nếu API trả về lỗi dạng text, cứ để except bên dưới xử lý tiếp candidate khác
-            if isinstance(data, dict) and str(data).lower().find("error") >= 0 and "status" in data and data["status"] != "success":
-                last_err = Exception(f"provider error with {keyname}: {data}")
+    for b in _bases_to_try(base_url):
+        url = f"{b}/product.php"
+        for keyname in _KEY_CANDIDATES:
+            try:
+                params = {keyname: api_key, "id": product_id}
+                data = _http_get_json(url, params)
+                return data
+            except Exception as e:
+                last_err = e
                 continue
-            return data
-        except Exception as e:
-            last_err = e
-            continue
-    # nếu tất cả đều fail
-    raise Exception(f"product.php refused all key formats: {last_err}")
+    raise Exception(f"product.php failed on all bases/key formats: {last_err}")
 
 def provider_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
-    """
-    Tự thử key/api_key/api_keyy cho buy_product (form-data)
-    """
-    url = f"{base_url.rstrip('/')}/buy_product"
     last_err = None
-    for keyname in _KEY_CANDIDATES:
-        try:
-            data = {"action": "buyProduct", "id": product_id, "amount": amount, keyname: api_key}
-            res = _http_post_json(url, data)
-            return res
-        except Exception as e:
-            last_err = e
-            continue
-    raise Exception(f"buy_product refused all key formats: {last_err}")
+    for b in _bases_to_try(base_url):
+        url = f"{b}/buy_product"
+        for keyname in _KEY_CANDIDATES:
+            try:
+                data = {"action": "buyProduct", "id": product_id, "amount": amount, keyname: api_key}
+                res = _http_post_json(url, data)
+                return res
+            except Exception as e:
+                last_err = e
+                continue
+    raise Exception(f"buy_product failed on all bases/key formats: {last_err}")
 
 # ====== Utilities ======
 def _extract_int(value):
@@ -96,7 +95,7 @@ def _extract_int(value):
     if isinstance(value, (int, float)):
         return int(value)
     s = str(value)
-    m = re.search(r'[-+]?\d[\d,\.]*', s)
+    m = re.search(r'[-+]?\\d[\\d,\\.]*', s)
     if not m:
         return None
     num = m.group(0).replace('.', '').replace(',', '')
@@ -463,7 +462,7 @@ def fetch():
         code = e.response.status_code if e.response is not None else 502
         return jsonify({"status":"error","msg":f"provider http {code}"}), 502
     except Exception as e:
-        return jsonify({"status":"error","msg":f"provider error: {e}"}), 502
+        return jsonify({"status":"error","msg":"provider error: {e}"}), 502
 
     if res.get("status") != "success":
         return jsonify({"status":"error","msg":res}), 409
