@@ -1,6 +1,4 @@
-# Multi-key per product + buffer (<5s)
-- Quản lý **nhiều input_key** cho **một SKU**, mỗi key map tới một `product_id` trên mail72h.
-- Endpoint hỗ trợ:
-  - `/stock?key=<input_key>` (khuyên dùng) hoặc `/stock?sku=<sku>&key=<input_key>`
-  - `/fetch?key=<input_key>&order_id=...&quantity=...` (cũng hỗ trợ thêm `sku=`)
-- Buffer local để đảm bảo trả hàng <5s; thiếu thì gọi mail72h với timeout ngắn.
+# Direct mode (no buffer)
+- Quản lý nhiều `input_key` ↔ `product_id`.
+- `/stock?key=...` trả 9999 (không chặn mua).
+- `/fetch?key=...&quantity=...` gọi trực tiếp mail72h với timeout 4s để đáp ứng <5s.
