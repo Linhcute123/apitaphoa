@@ -6,9 +6,8 @@ import requests
 
 DB = os.getenv("DB_PATH", "store.db")
 MAIL72H_BASE = os.getenv("MAIL72H_BASE", "https://mail72h.com/api")
-MAIL72H_API_KEY = os.getenv("MAIL72H_API_KEY", "REPLACE_ME")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
-MAIL72H_TIMEOUT = int(os.getenv("MAIL72H_TIMEOUT", "4"))  # giữ <5s tổng thể
+MAIL72H_TIMEOUT = int(os.getenv("MAIL72H_TIMEOUT", "4"))  # giữ tổng <5s
 
 app = Flask(__name__)
 
@@ -25,6 +24,7 @@ def init_db():
             sku TEXT NOT NULL,
             input_key TEXT NOT NULL UNIQUE,
             product_id INTEGER NOT NULL,
+            mail72h_api_key TEXT NOT NULL,
             note TEXT,
             is_active INTEGER DEFAULT 1
         )""")
@@ -32,16 +32,24 @@ def init_db():
 
 init_db()
 
-def mail72h_buy(product_id: int, amount: int, coupon: str|None=None) -> dict:
+# ========= Mail72h helpers (per-key API) =========
+def mail72h_buy(api_key: str, product_id: int, amount: int, coupon: str|None=None) -> dict:
     data = {
         "action": "buyProduct",
         "id": product_id,
         "amount": amount,
-        "api_key": MAIL72H_API_KEY
+        "api_key": api_key
     }
     if coupon:
         data["coupon"] = coupon
     r = requests.post(f"{MAIL72H_BASE}/buy_product", data=data, timeout=MAIL72H_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def mail72h_product_detail(api_key: str, product_id: int) -> dict:
+    r = requests.get(f"{MAIL72H_BASE}/product.php",
+                     params={"api_key": api_key, "id": product_id},
+                     timeout=MAIL72H_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
@@ -50,43 +58,48 @@ def find_map_by_key(key: str):
         row = con.execute("SELECT * FROM keymaps WHERE input_key=? AND is_active=1", (key,)).fetchone()
         return row
 
+# ========= Admin UI =========
 ADMIN_TPL = """
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
-<title>Quản lý nhiều input_key (direct mode)</title>
+<title>Direct mode: per-key API + đúng kho</title>
 <style>
   body { font-family: system-ui, Arial; padding: 24px; }
   table { border-collapse: collapse; width: 100%; margin-top: 16px; }
   th, td { border:1px solid #ddd; padding:8px; }
   th { background:#f5f5f5; text-align:left; }
-  input[type=text], input[type=number] { width: 100%; padding:6px; }
+  input[type=text], input[type=number], input[type=password] { width: 100%; padding:6px; }
   .row { display:flex; gap:12px; flex-wrap:wrap; }
   .card { border:1px solid #ddd; padding:16px; border-radius:8px; margin-bottom:16px; }
   .btn { padding:8px 12px; border:1px solid #333; background:#fff; cursor:pointer; }
   .btn.primary { background:#111; color:#fff; }
   code { background:#f4f4f4; padding:2px 4px; border-radius:4px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>
 </head>
 <body>
-  <h2>Direct mode: lấy hàng trực tiếp mail72h (không buffer)</h2>
-
+  <h2>Direct: lấy hàng thẳng từ mail72h (mỗi key có API key riêng)</h2>
   <div class="card">
-    <h3>Thêm/Cập nhật input_key</h3>
+    <h3>Thêm/Cập nhật key</h3>
     <form method="post" action="{{ url_for('admin_add_keymap') }}?admin_secret={{ admin_secret }}">
       <div class="row">
-        <div style="flex:1 1 160px">
+        <div style="flex:1 1 140px">
           <label>SKU</label>
           <input type="text" name="sku" required placeholder="vd: edu24h">
         </div>
-        <div style="flex:2 1 280px">
+        <div style="flex:2 1 240px">
           <label>input_key (Tạp Hóa)</label>
-          <input type="text" name="input_key" required placeholder="key-abc">
+          <input class="mono" type="text" name="input_key" required placeholder="key-abc">
         </div>
-        <div style="flex:1 1 160px">
+        <div style="flex:1 1 140px">
           <label>product_id (mail72h)</label>
-          <input type="number" name="product_id" required placeholder="12345">
+          <input class="mono" type="number" name="product_id" required placeholder="12345">
+        </div>
+        <div style="flex:2 1 260px">
+          <label>API key (mail72h) cho key này</label>
+          <input class="mono" type="password" name="api_key" required placeholder="paste API key">
         </div>
         <div style="flex:3 1 320px">
           <label>Ghi chú</label>
@@ -97,15 +110,16 @@ ADMIN_TPL = """
     </form>
   </div>
 
-  <h3>Danh sách key ↔ product_id</h3>
+  <h3>Key ↔ product_id (mỗi key có API key riêng)</h3>
   <table>
-    <thead><tr><th>SKU</th><th>input_key</th><th>product_id</th><th>Active</th><th>Ghi chú</th><th>Hành động</th></tr></thead>
+    <thead><tr><th>SKU</th><th>input_key</th><th>product_id</th><th>API key (ẩn)</th><th>Active</th><th>Ghi chú</th><th>Hành động</th></tr></thead>
     <tbody>
     {% for m in maps %}
       <tr>
         <td>{{ m['sku'] }}</td>
         <td><code>{{ m['input_key'] }}</code></td>
         <td>{{ m['product_id'] }}</td>
+        <td>••••••••</td>
         <td>{{ m['is_active'] }}</td>
         <td>{{ m['note'] or '' }}</td>
         <td>
@@ -123,10 +137,10 @@ ADMIN_TPL = """
 
   <h3>Endpoint cho Tạp Hóa</h3>
   <pre>
-Tồn kho (không gọi mail72h, trả giá trị lớn để không chặn):
-  GET /stock?key=&lt;input_key&gt;   → {"sum": 9999}
+Tồn kho (đọc trực tiếp từ mail72h → khớp số lượng):
+  GET /stock?key=&lt;input_key&gt;
 
-Lấy hàng (gọi trực tiếp mail72h, timeout {{ timeout }}s):
+Lấy hàng (mua trực tiếp từ mail72h):
   GET /fetch?key=&lt;input_key&gt;&order_id={order_id}&quantity={quantity}
   </pre>
 </body>
@@ -142,7 +156,7 @@ def admin_index():
     require_admin()
     with db() as con:
         maps = con.execute("SELECT * FROM keymaps ORDER BY sku, id").fetchall()
-    return render_template_string(ADMIN_TPL, maps=maps, admin_secret=ADMIN_SECRET, timeout=MAIL72H_TIMEOUT)
+    return render_template_string(ADMIN_TPL, maps=maps, admin_secret=ADMIN_SECRET)
 
 @app.route("/admin/keymap", methods=["POST"])
 def admin_add_keymap():
@@ -150,19 +164,21 @@ def admin_add_keymap():
     sku = request.form.get("sku","").strip()
     input_key = request.form.get("input_key","").strip()
     product_id = request.form.get("product_id","").strip()
+    api_key = request.form.get("api_key","").strip()
     note = request.form.get("note","").strip()
-    if not sku or not input_key or not product_id.isdigit():
+    if not sku or not input_key or not product_id.isdigit() or not api_key:
         abort(400)
     with db() as con:
         con.execute("""
-            INSERT INTO keymaps(sku, input_key, product_id, note, is_active)
-            VALUES(?,?,?,?,1)
+            INSERT INTO keymaps(sku, input_key, product_id, mail72h_api_key, note, is_active)
+            VALUES(?,?,?,?,?,1)
             ON CONFLICT(input_key) DO UPDATE SET
               sku=excluded.sku,
               product_id=excluded.product_id,
+              mail72h_api_key=excluded.mail72h_api_key,
               note=excluded.note,
               is_active=1
-        """, (sku, input_key, int(product_id), note))
+        """, (sku, input_key, int(product_id), api_key, note))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
@@ -185,7 +201,7 @@ def admin_delete_key(kmid):
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-# ===== Public endpoints =====
+# ========= Public endpoints =========
 @app.route("/stock")
 def stock():
     key = request.args.get("key","").strip()
@@ -194,8 +210,15 @@ def stock():
     row = find_map_by_key(key)
     if not row:
         return jsonify({"status":"error","msg":"unknown key"}), 404
-    # Trả số lớn để Tạp Hóa không chặn mua (vì bạn muốn mua trực tiếp)
-    return jsonify({"sum": 9999})
+    # đọc kho thực từ mail72h
+    try:
+        pd = mail72h_product_detail(row["mail72h_api_key"], int(row["product_id"]))
+        # tuỳ cấu trúc JSON của mail72h, bạn có thể cần đổi chỗ lấy số tồn:
+        stock_val = int(pd.get("data", {}).get("stock", 0))
+    except Exception as e:
+        # Nếu API không trả tồn kho, fallback về số lớn để không chặn bán
+        stock_val = 9999
+    return jsonify({"sum": stock_val})
 
 @app.route("/fetch")
 def fetch():
@@ -209,12 +232,13 @@ def fetch():
         if qty<=0 or qty>1000: raise ValueError()
     except Exception:
         return jsonify({"status":"error","msg":"invalid quantity"}), 400
+
     row = find_map_by_key(key)
     if not row:
         return jsonify({"status":"error","msg":"unknown key"}), 404
 
     try:
-        res = mail72h_buy(int(row["product_id"]), qty)
+        res = mail72h_buy(row["mail72h_api_key"], int(row["product_id"]), qty)
     except requests.HTTPError as e:
         code = e.response.status_code if e.response is not None else 502
         return jsonify({"status":"error","msg":f"mail72h http {code}"}), 502

@@ -1,14 +1,12 @@
 services:
   - type: web
-    name: taphoa-mail72h-direct
+    name: taphoa-mail72h-direct-perkey
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn app:app -b 0.0.0.0:$PORT"
     envVars:
       - key: ADMIN_SECRET
-        sync: false
-      - key: MAIL72H_API_KEY
         sync: false
       - key: MAIL72H_BASE
         value: https://mail72h.com/api
