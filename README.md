@@ -1,4 +1,10 @@
-# Direct mode (no buffer)
-- Quản lý nhiều `input_key` ↔ `product_id`.
-- `/stock?key=...` trả 9999 (không chặn mua).
-- `/fetch?key=...&quantity=...` gọi trực tiếp mail72h với timeout 4s để đáp ứng <5s.
+# Tạp Hóa – Multi Site Direct (Final Full)
+- Admin: /admin?admin_secret=adminlinhdz
+- /stock & /fetch gọi thẳng provider (mail72h style)
+- Deploy: Render (gunicorn).
+
+ENV:
+ADMIN_SECRET=adminlinhdz
+DB_PATH=store_v2.db
+MAIL72H_TIMEOUT=4
+DEBUG_ERRORS=0

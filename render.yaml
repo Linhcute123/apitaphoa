@@ -1,16 +1,16 @@
 services:
   - type: web
-    name: taphoa-multi-site-direct-v2-diag
+    name: taphoa-multi-site-final
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn app:app -b 0.0.0.0:$PORT"
     envVars:
       - key: ADMIN_SECRET
-        sync: false
+        value: adminlinhdz
       - key: DB_PATH
         value: store_v2.db
-      - key: MAIL_TIMEOUT
+      - key: MAIL72H_TIMEOUT
         value: "4"
       - key: DEBUG_ERRORS
-        value: "1"
+        value: "0"
