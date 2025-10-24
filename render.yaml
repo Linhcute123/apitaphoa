@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: taphoa-multi-provider
+    name: taphoa-multi-provider-simple-v3
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"

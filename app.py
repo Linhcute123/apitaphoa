@@ -3,15 +3,21 @@ import os, json, sqlite3, re, traceback
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
 
-# ====== ENV ======
 DB = os.getenv("DB_PATH", "store_profiles.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "adminlinhdz")
 REQ_TIMEOUT = int(os.getenv("REQ_TIMEOUT", "4"))
 DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") in ("1","true","True","yes","YES")
 
+# ---- Mail72h-friendly defaults
+DEFAULT_DETAIL = "/api/product.php"
+DEFAULT_LIST   = "/api/products.php"
+DEFAULT_BUY    = "/api/buy_product"
+# prefer api_key first for mail72h
+DEFAULT_KEY_NAMES = ("api_key","key","api_keyy")
+
 app = Flask(__name__)
 
-# ====== DB & MIGRATIONS ======
+# ===== DB =====
 def db():
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
@@ -30,11 +36,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             code TEXT NOT NULL UNIQUE,
             base_url TEXT NOT NULL,
-            detail_path TEXT,
-            list_path TEXT,
-            buy_path TEXT,
-            key_param TEXT,
-            stock_field TEXT
+            api_key TEXT
         )""")
         con.execute("""
         CREATE TABLE IF NOT EXISTS keymaps(
@@ -43,35 +45,15 @@ def init_db():
             sku TEXT NOT NULL,
             input_key TEXT NOT NULL,
             product_id INTEGER NOT NULL,
-            provider_api_key TEXT NOT NULL,
             is_active INTEGER DEFAULT 1,
             UNIQUE(input_key, site_id),
             FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
         )""")
-        # Backfill sensible defaults for paths if NULL
-        _ensure_col(con, "sites", "detail_path", "TEXT")
-        _ensure_col(con, "sites", "list_path", "TEXT")
-        _ensure_col(con, "sites", "buy_path", "TEXT")
-        _ensure_col(con, "sites", "key_param", "TEXT")
-        _ensure_col(con, "sites", "stock_field", "TEXT")
-        con.execute("""UPDATE sites SET
-            detail_path = COALESCE(detail_path, '/api/product.php'),
-            list_path   = COALESCE(list_path,   '/api/products.php'),
-            buy_path    = COALESCE(buy_path,    '/api/buy_product')
-        """)
+        _ensure_col(con,"sites","api_key","TEXT")
         con.commit()
 init_db()
 
-# ====== Provider helpers (generic) ======
-DEFAULT_KEY_NAMES = ("key", "api_key", "api_keyy")
-
-def _join_url(base, path):
-    base = base.rstrip("/")
-    path = path.strip()
-    if not path.startswith("/"):
-        path = "/" + path
-    return base + path
-
+# ===== HTTP helpers =====
 def _http_get_json(url, params):
     r = requests.get(url, params=params, timeout=REQ_TIMEOUT)
     r.raise_for_status()
@@ -83,194 +65,150 @@ def _http_post_json(url, data):
     return r.json()
 
 def _extract_int(value):
-    if isinstance(value, (int, float)):
-        return int(value)
-    if value is None:
-        return None
-    s = str(value)
-    m = re.search(r'[-+]?\\d[\\d,\\.]*', s)
-    if not m:
-        return None
-    num = m.group(0).replace('.', '').replace(',', '')
-    try:
-        return int(num)
-    except Exception:
-        return None
+    if isinstance(value,(int,float)): return int(value)
+    if value is None: return None
+    m = re.search(r'[-+]?\\d[\\d,\\.]*', str(value))
+    if not m: return None
+    num = m.group(0).replace('.','').replace(',','')
+    try: return int(num)
+    except: return None
 
 def _deep_find_stock(obj):
-    # common aliases
-    keys = {'stock','tonkho','available','remain','left','quantity','qty','soluong','so_luong'}
+    keys = {'stock','tonkho','available','remain','left','quantity','qty','soluong','so_luong','sum'}
     if isinstance(obj, dict):
         for k,v in obj.items():
             if k.lower() in keys:
                 n = _extract_int(v)
-                if n is not None:
-                    return n
+                if n is not None: return n
             n = _deep_find_stock(v)
-            if n is not None:
-                return n
+            if n is not None: return n
     elif isinstance(obj, list):
         for it in obj:
             n = _deep_find_stock(it)
-            if n is not None:
-                return n
+            if n is not None: return n
     return None
 
-def _get_site_and_key(input_key: str):
+def _join(base, path):
+    base = base.rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
+
+def _candidates(base, path):
+    """
+    Given base and an '/api/...' path, try both with /api and without /api.
+    """
+    url1 = _join(base, path)
+    if "/api/" in path:
+        path2 = path.replace("/api/", "/", 1)
+    else:
+        path2 = "/api" + (path if path.startswith("/") else "/" + path)
+    url2 = _join(base, path2)
+    # return unique in order
+    seen=set(); out=[]
+    for u in (url1,url2):
+        if u not in seen:
+            out.append(u); seen.add(u)
+    return out
+
+# ===== Provider adapters =====
+def _site_by_key(input_key):
     with db() as con:
         row = con.execute("""
-        SELECT k.*, s.code AS site_code, s.base_url, s.detail_path, s.list_path, s.buy_path, s.key_param, s.stock_field
+        SELECT k.*, s.code as site_code, s.base_url, s.api_key
         FROM keymaps k JOIN sites s ON s.id = k.site_id
         WHERE k.input_key=? AND k.is_active=1
         """, (input_key,)).fetchone()
     return row
 
-def _choose_keynames(preferred: str | None):
-    if preferred and preferred.strip():
-        return (preferred.strip(),)
-    return DEFAULT_KEY_NAMES
-
-def provider_product_detail(site, pid: int):
-    url = _join_url(site["base_url"], site["detail_path"] or "/api/product.php")
-    for keyname in _choose_keynames(site["key_param"]):
-        try:
-            return _http_get_json(url, {keyname: site["provider_api_key"], "id": pid})
-        except Exception:
-            continue
+def _detail_json(site, pid):
+    for url in _candidates(site["base_url"], DEFAULT_DETAIL):
+        for keyname in DEFAULT_KEY_NAMES:
+            try:
+                return _http_get_json(url, {keyname: site["api_key"], "id": pid})
+            except Exception:
+                continue
     raise Exception("detail_refused")
 
-def provider_products_list(site):
-    url = _join_url(site["base_url"], site["list_path"] or "/api/products.php")
-    for keyname in _choose_keynames(site["key_param"]):
-        try:
-            return _http_get_json(url, {keyname: site["provider_api_key"]})
-        except Exception:
-            continue
+def _list_json(site):
+    for url in _candidates(site["base_url"], DEFAULT_LIST):
+        for keyname in DEFAULT_KEY_NAMES:
+            try:
+                return _http_get_json(url, {keyname: site["api_key"]})
+            except Exception:
+                continue
     raise Exception("list_refused")
 
-def provider_buy(site, pid: int, amount: int):
-    url = _join_url(site["base_url"], site["buy_path"] or "/api/buy_product")
-    for keyname in _choose_keynames(site["key_param"]):
-        try:
-            data = {"action": "buyProduct", "id": pid, "amount": amount, keyname: site["provider_api_key"]}
-            return _http_post_json(url, data)
-        except Exception:
-            continue
+def _buy(site, pid, amount):
+    for url in _candidates(site["base_url"], DEFAULT_BUY):
+        for keyname in DEFAULT_KEY_NAMES:
+            try:
+                return _http_post_json(url, {"action":"buyProduct","id":pid,"amount":amount,keyname:site["api_key"]})
+            except Exception:
+                continue
     raise Exception("buy_refused")
 
-def provider_resolve_stock(site, pid: int) -> int:
-    # 1) try detail
+def resolve_stock(site, pid):
+    # detail first
     try:
-        d = provider_product_detail(site, pid)
-        if site["stock_field"]:
-            # explicit field path like "data.stock" or "stock"
-            cur = d
-            for part in site["stock_field"].split("."):
-                if isinstance(cur, dict) and part in cur:
-                    cur = cur[part]
-                else:
-                    cur = None
-                    break
-            n = _extract_int(cur)
-        else:
-            n = _deep_find_stock(d)
-        if isinstance(n, int):
-            return max(0, n)
+        d = _detail_json(site, pid)
+        n = _deep_find_stock(d)
+        if isinstance(n,int): return max(0,n)
     except Exception:
         pass
-    # 2) fallback list
+    # then list
     try:
-        lst = provider_products_list(site)
+        lst = _list_json(site)
         items = []
         if isinstance(lst, dict):
             for k in ("products","data","items","result"):
                 v = lst.get(k)
-                if isinstance(v, list):
-                    items = v
-                    break
-        elif isinstance(lst, list):
-            items = lst
+                if isinstance(v, list): items=v; break
+        elif isinstance(lst,list): items = lst
         for it in items:
-            if not isinstance(it, dict): 
-                continue
+            if not isinstance(it, dict): continue
             pid2 = it.get("id", it.get("product_id"))
-            if str(pid2) == str(pid):
-                if site["stock_field"]:
-                    cur = it
-                    for part in site["stock_field"].split("."):
-                        if isinstance(cur, dict) and part in cur:
-                            cur = cur[part]
-                        else:
-                            cur = None
-                            break
-                    n = _extract_int(cur)
-                else:
-                    n = _deep_find_stock(it)
-                if isinstance(n, int):
-                    return max(0, n)
+            if str(pid2)==str(pid):
+                n = _deep_find_stock(it)
+                if isinstance(n,int): return max(0,n)
     except Exception:
         pass
     raise Exception("stock_not_found")
 
-# ====== Admin UI ======
+# ===== Admin UI =====
 TPL = """
 <!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<title>Tạp Hóa – Multi Provider</title>
+<html><head><meta charset="utf-8" />
+<title>Tạp Hóa – Multi Provider (Đơn giản)</title>
 <style>
-  :root { --bd:#e5e7eb; }
-  body { font-family: system-ui, Arial; padding:28px; color:#111 }
-  .card { border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:18px; }
-  .row { display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; align-items:end; }
-  .col-2 { grid-column: span 2; } .col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; } .col-6 { grid-column: span 6; } .col-12 { grid-column: span 12; }
-  label { font-size:12px; text-transform:uppercase; color:#444; }
-  input { width:100%; padding:10px 12px; border:1px solid var(--bd); border-radius:10px; }
-  table { width:100%; border-collapse:collapse; }
-  th, td { padding:10px 12px; border-bottom:1px solid var(--bd); text-align:left; }
-  code { background:#f3f4f6; padding:2px 6px; border-radius:6px; }
-  button { padding:10px 14px; border-radius:10px; border:1px solid #111; background:#111; color:#fff; cursor:pointer; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+:root { --bd:#e5e7eb; }
+body{font-family:system-ui,Arial;padding:28px;color:#111}
+.card{border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:18px}
+.row{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;align-items:end}
+.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-6{grid-column:span 6}.col-12{grid-column:span 12}
+label{font-size:12px;text-transform:uppercase;color:#444}
+input{width:100%;padding:10px 12px;border:1px solid var(--bd);border-radius:10px}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px 12px;border-bottom:1px solid var(--bd);text-align:left}
+code{background:#f3f4f6;padding:2px 6px;border-radius:6px}
+button,.btn{padding:10px 14px;border-radius:10px;border:1px solid #111;background:#111;color:#fff;cursor:pointer;text-decoration:none}
+.btn.red{background:#b91c1c;border-color:#991b1b}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 </style>
 </head>
 <body>
-  <h2>⚙️ Multi Provider (nhiều "folder web")</h2>
+  <h2>⚙️ Multi Provider – API key theo Site (Form đơn giản)</h2>
 
   <div class="card">
     <h3>1) Thêm/Update Site (Folder Web)</h3>
     <form method="post" action="{{ url_for('admin_add_site') }}?admin_secret={{ asec }}">
       <div class="row">
-        <div class="col-3">
-          <label>Site code</label>
-          <input class="mono" type="text" name="code" placeholder="mail72h | myweb" required>
-        </div>
-        <div class="col-6">
-          <label>Base URL</label>
-          <input class="mono" type="text" name="base_url" placeholder="https://mail72h.com" required>
-        </div>
-        <div class="col-3">
-          <label>Key param (tuỳ chọn)</label>
-          <input class="mono" type="text" name="key_param" placeholder="auto | key | api_key">
-        </div>
-        <div class="col-4">
-          <label>Detail path</label>
-          <input class="mono" type="text" name="detail_path" placeholder="/api/product.php">
-        </div>
-        <div class="col-4">
-          <label>List path</label>
-          <input class="mono" type="text" name="list_path" placeholder="/api/products.php">
-        </div>
-        <div class="col-4">
-          <label>Buy path</label>
-          <input class="mono" type="text" name="buy_path" placeholder="/api/buy_product">
-        </div>
-        <div class="col-6">
-          <label>Stock field (tuỳ chọn)</label>
-          <input class="mono" type="text" name="stock_field" placeholder="vd: data.stock (để trống = auto detect)">
-        </div>
+        <div class="col-3"><label>Site code</label><input class="mono" name="code" placeholder="mail72h" required></div>
+        <div class="col-6"><label>Base URL</label><input class="mono" name="base_url" placeholder="https://mail72h.com" required></div>
+        <div class="col-3"><label>API key</label><input class="mono" name="api_key" type="password" required></div>
         <div class="col-3"><button>Lưu site</button></div>
       </div>
+      <p style="color:#666;margin-top:8px">* Đường dẫn & tham số mặc định đã tối ưu cho mail72h (<code>/api/product.php</code>, <code>/api/products.php</code>, <code>/api/buy_product</code>, key=<code>api_key</code>). Hệ thống tự thử cả bản có/không có <code>/api</code>.</p>
     </form>
   </div>
 
@@ -278,11 +216,10 @@ TPL = """
     <h3>2) Thêm/Update Key</h3>
     <form method="post" action="{{ url_for('admin_add_key') }}?admin_secret={{ asec }}">
       <div class="row">
-        <div class="col-3"><label>Site</label><input class="mono" type="text" name="site_code" placeholder="mail72h" required></div>
-        <div class="col-3"><label>SKU</label><input class="mono" type="text" name="sku" placeholder="edu24h" required></div>
-        <div class="col-3"><label>input_key</label><input class="mono" type="text" name="input_key" placeholder="key-abc" required></div>
-        <div class="col-3"><label>product_id</label><input class="mono" type="number" name="product_id" placeholder="12345" required></div>
-        <div class="col-6"><label>API key của site</label><input class="mono" type="password" name="provider_api_key" placeholder="paste API key" required></div>
+        <div class="col-3"><label>Site</label><input class="mono" name="site_code" placeholder="mail72h" required></div>
+        <div class="col-3"><label>SKU</label><input class="mono" name="sku" placeholder="edu24h" required></div>
+        <div class="col-3"><label>input_key</label><input class="mono" name="input_key" placeholder="key-abc" required></div>
+        <div class="col-3"><label>product_id</label><input class="mono" name="product_id" type="number" placeholder="28" required></div>
         <div class="col-3"><button>Lưu key</button></div>
       </div>
     </form>
@@ -291,17 +228,13 @@ TPL = """
   <div class="card">
     <h3>Sites</h3>
     <table>
-      <thead><tr><th>Code</th><th>Base</th><th>Key param</th><th>Detail</th><th>List</th><th>Buy</th><th>Stock field</th></tr></thead>
+      <thead><tr><th>Code</th><th>Base</th><th>Xoá</th></tr></thead>
       <tbody>
       {% for s in sites %}
         <tr>
           <td><code>{{ s['code'] }}</code></td>
           <td class="mono">{{ s['base_url'] }}</td>
-          <td class="mono">{{ s['key_param'] or 'auto' }}</td>
-          <td class="mono">{{ s['detail_path'] }}</td>
-          <td class="mono">{{ s['list_path'] }}</td>
-          <td class="mono">{{ s['buy_path'] }}</td>
-          <td class="mono">{{ s['stock_field'] or '' }}</td>
+          <td><a class="btn red" href="{{ url_for('admin_delete_site') }}?admin_secret={{ asec }}&code={{ s['code'] }}" onclick="return confirm('Xoá site {{ s['code'] }}?')">Xoá</a></td>
         </tr>
       {% endfor %}
       </tbody>
@@ -311,20 +244,22 @@ TPL = """
   <div class="card">
     <h3>Keys</h3>
     <table>
-      <thead><tr><th>SKU</th><th>input_key</th><th>product_id</th><th>API key (ẩn)</th><th>Active</th><th>Test</th></tr></thead>
+      <thead><tr><th>ID</th><th>Site</th><th>SKU</th><th>input_key</th><th>product_id</th><th>Active</th><th>Test</th><th>Xoá</th></tr></thead>
       <tbody>
       {% for m in maps %}
         <tr>
+          <td>{{ m['id'] }}</td>
+          <td><code>{{ m['site_code'] }}</code></td>
           <td>{{ m['sku'] }}</td>
           <td><code>{{ m['input_key'] }}</code></td>
           <td>{{ m['product_id'] }}</td>
-          <td>••••••••</td>
           <td>{{ m['is_active'] }}</td>
           <td>
             <a class="mono" href="{{ url_for('admin_test_stock') }}?admin_secret={{ asec }}&key={{ m['input_key'] }}" target="_blank">Test stock</a>
             &nbsp;|&nbsp;
             <a class="mono" href="{{ url_for('admin_test_fetch') }}?admin_secret={{ asec }}&key={{ m['input_key'] }}&quantity=1" target="_blank">Test fetch</a>
           </td>
+          <td><a class="btn red" href="{{ url_for('admin_delete_key') }}?admin_secret={{ asec }}&id={{ m['id'] }}" onclick="return confirm('Xoá key {{ m['input_key'] }}?')">Xoá</a></td>
         </tr>
       {% endfor %}
       </tbody>
@@ -332,17 +267,25 @@ TPL = """
   </div>
 
   <div class="card">
+    <h3>Diag nhanh</h3>
+    <form method="get" action="{{ url_for('admin_diag') }}">
+      <input type="hidden" name="admin_secret" value="{{ asec }}"/>
+      <div class="row">
+        <div class="col-4"><label>input_key</label><input class="mono" name="key" placeholder="key-abc"></div>
+        <div class="col-3"><label>product_id</label><input class="mono" name="pid" placeholder="28"></div>
+        <div class="col-3"><button>Xem raw</button></div>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
     <h3>Endpoint cho Tạp Hóa</h3>
     <pre class="mono">
-Tồn kho (đọc trực tiếp):
-  GET /stock?key=&lt;input_key&gt;
-
-Lấy hàng (mua trực tiếp):
-  GET /fetch?key=&lt;input_key&gt;&order_id={order_id}&quantity={quantity}
+Tồn kho (đọc trực tiếp): GET /stock?key=&lt;input_key&gt;
+Lấy hàng (mua trực tiếp): GET /fetch?key=&lt;input_key&gt;&order_id={order_id}&quantity={quantity}
     </pre>
   </div>
-</body>
-</html>
+</body></html>
 """
 
 def require_admin():
@@ -361,8 +304,8 @@ def admin_index():
     with db() as con:
         sites = con.execute("SELECT * FROM sites ORDER BY code").fetchall()
         maps = con.execute("""
-            SELECT k.*, s.code AS site_code FROM keymaps k
-            JOIN sites s ON s.id = k.site_id
+            SELECT k.*, s.code AS site_code
+            FROM keymaps k JOIN sites s ON s.id = k.site_id
             ORDER BY s.code, k.id
         """).fetchall()
     return render_template_string(TPL, sites=sites, maps=maps, asec=ADMIN_SECRET)
@@ -373,25 +316,17 @@ def admin_add_site():
     f = request.form
     code = f.get("code","").strip()
     base_url = f.get("base_url","").strip()
-    detail_path = f.get("detail_path","/api/product.php").strip() or "/api/product.php"
-    list_path   = f.get("list_path","/api/products.php").strip() or "/api/products.php"
-    buy_path    = f.get("buy_path","/api/buy_product").strip() or "/api/buy_product"
-    key_param   = f.get("key_param","").strip()
-    stock_field = f.get("stock_field","").strip()
-    if not code or not base_url:
-        return "Missing code/base_url", 400
+    api_key = f.get("api_key","").strip()
+    if not code or not base_url or not api_key:
+        return "Missing code/base_url/api_key", 400
     with db() as con:
         con.execute("""
-        INSERT INTO sites(code, base_url, detail_path, list_path, buy_path, key_param, stock_field)
-        VALUES(?,?,?,?,?,?,?)
+        INSERT INTO sites(code, base_url, api_key)
+        VALUES(?,?,?)
         ON CONFLICT(code) DO UPDATE SET
             base_url=excluded.base_url,
-            detail_path=excluded.detail_path,
-            list_path=excluded.list_path,
-            buy_path=excluded.buy_path,
-            key_param=excluded.key_param,
-            stock_field=excluded.stock_field
-        """, (code, base_url, detail_path, list_path, buy_path, key_param, stock_field))
+            api_key=excluded.api_key
+        """, (code, base_url, api_key))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
@@ -403,95 +338,98 @@ def admin_add_key():
     sku = f.get("sku","").strip()
     input_key = f.get("input_key","").strip()
     product_id = f.get("product_id","").strip()
-    provider_api_key = f.get("provider_api_key","").strip()
-    if not all([site_code, sku, input_key, product_id, provider_api_key]) or not product_id.isdigit():
+    if not all([site_code, sku, input_key, product_id]) or not product_id.isdigit():
         return "Missing/invalid fields", 400
     with db() as con:
         s = con.execute("SELECT id FROM sites WHERE code=?", (site_code,)).fetchone()
-        if not s:
-            return "Site not found", 400
+        if not s: return "Site not found", 400
         con.execute("""
-        INSERT INTO keymaps(site_id, sku, input_key, product_id, provider_api_key, is_active)
-        VALUES(?,?,?,?,?,1)
+        INSERT INTO keymaps(site_id, sku, input_key, product_id, is_active)
+        VALUES(?,?,?,?,1)
         ON CONFLICT(input_key, site_id) DO UPDATE SET
             sku=excluded.sku,
             product_id=excluded.product_id,
-            provider_api_key=excluded.provider_api_key,
             is_active=1
-        """, (s["id"], sku, input_key, int(product_id), provider_api_key))
+        """, (s["id"], sku, input_key, int(product_id)))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-# ====== Admin Test endpoints (no site param needed) ======
-@app.route("/admin/test/stock")
-def admin_test_stock():
+@app.route("/admin/delete/site")
+def admin_delete_site():
+    require_admin()
+    code = request.args.get("code","").strip()
+    if not code: return "missing code", 400
+    with db() as con:
+        con.execute("DELETE FROM sites WHERE code=?", (code,))
+        con.commit()
+    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
+
+@app.route("/admin/delete/key")
+def admin_delete_key():
+    require_admin()
+    kid = request.args.get("id","").strip()
+    if not kid or not kid.isdigit(): return "missing id", 400
+    with db() as con:
+        con.execute("DELETE FROM keymaps WHERE id=?", (int(kid),))
+        con.commit()
+    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
+
+# ----- Diag raw -----
+@app.route("/admin/diag")
+def admin_diag():
     require_admin()
     key = request.args.get("key","").strip()
-    if not key:
-        return jsonify({"status":"error","msg":"missing key"}), 400
-    km = _get_site_and_key(key)
+    pid = request.args.get("pid","").strip()
+    if not key or not pid:
+        return jsonify({"status":"error","msg":"missing key/pid"}), 400
+    km = _site_by_key(key)
     if not km:
         return jsonify({"status":"error","msg":"unknown key"}), 404
+    out = {}
     try:
-        stock = provider_resolve_stock(km, int(km["product_id"]))
-        return jsonify({"parsed_stock": stock})
+        out["detail"] = _detail_json(km, int(pid))
     except Exception as e:
-        return jsonify({"status":"error","msg":str(e)}), 502
-
-@app.route("/admin/test/fetch")
-def admin_test_fetch():
-    require_admin()
-    key = request.args.get("key","").strip()
-    qty = int(request.args.get("quantity","1") or "1")
-    km = _get_site_and_key(key)
-    if not km:
-        return jsonify({"status":"error","msg":"unknown key"}), 404
+        out["detail_error"] = str(e)
     try:
-        res = provider_buy(km, int(km["product_id"]), qty)
-        return jsonify(res)
+        out["list"] = _list_json(km)
     except Exception as e:
-        return jsonify({"status":"error","msg":str(e)}), 502
+        out["list_error"] = str(e)
+    return jsonify(out)
 
-# ====== Public endpoints ======
+# ===== Public =====
 @app.route("/stock")
 def stock():
-    input_key = request.args.get("key","").strip()
-    if not input_key:
-        return jsonify({"status":"error","msg":"missing key"}), 400
-    km = _get_site_and_key(input_key)
-    if not km:
-        return jsonify({"status":"error","msg":"unknown key"}), 404
+    key = request.args.get("key","").strip()
+    if not key: return jsonify({"status":"error","msg":"missing key"}), 400
+    km = _site_by_key(key)
+    if not km: return jsonify({"status":"error","msg":"unknown key"}), 404
     try:
-        stock = provider_resolve_stock(km, int(km["product_id"]))
-        return jsonify({"sum": int(stock)})
+        s = resolve_stock(km, int(km["product_id"]))
+        return jsonify({"sum": int(s)})
     except Exception as e:
         return jsonify({"status":"error","msg":str(e)}), 502
 
 @app.route("/fetch")
 def fetch():
-    input_key = request.args.get("key","").strip()
+    key = request.args.get("key","").strip()
     qty_s = request.args.get("quantity","").strip()
-    order_id = request.args.get("order_id","").strip()  # not required by provider but TapHoa expects it
-    if not input_key or not qty_s:
-        return jsonify({"status":"error","msg":"missing key/quantity"}), 400
+    order_id = request.args.get("order_id","").strip()  # not used; TapHoa expects
+    if not key or not qty_s: return jsonify({"status":"error","msg":"missing key/quantity"}), 400
     try:
         qty = int(qty_s)
         if qty <= 0 or qty > 1000: raise ValueError()
     except Exception:
         return jsonify({"status":"error","msg":"invalid quantity"}), 400
-
-    km = _get_site_and_key(input_key)
-    if not km:
-        return jsonify({"status":"error","msg":"unknown key"}), 404
+    km = _site_by_key(key)
+    if not km: return jsonify({"status":"error","msg":"unknown key"}), 404
     try:
-        res = provider_buy(km, int(km["product_id"]), qty)
-        return jsonify(res)
+        r = _buy(km, int(km["product_id"]), qty)
+        return jsonify(r)
     except Exception as e:
         return jsonify({"status":"error","msg":str(e)}), 502
 
 @app.route("/")
-def health():
-    return "OK", 200
+def health(): return "OK", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT","8000")))
