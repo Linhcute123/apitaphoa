@@ -1,4 +1,3 @@
-
 import os, json, sqlite3, re, traceback
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
@@ -255,9 +254,9 @@ button,.btn{padding:10px 14px;border-radius:10px;border:1px solid #111;backgroun
           <td>{{ m['product_id'] }}</td>
           <td>{{ m['is_active'] }}</td>
           <td>
-            <a class="mono" href="{{ url_for('admin_test_stock') }}?admin_secret={{ asec }}&key={{ m['input_key'] }}" target="_blank">Test stock</a>
+            <a class="mono" href="{{ url_for('stock') }}?key={{ m['input_key'] }}" target="_blank">Test stock</a>
             &nbsp;|&nbsp;
-            <a class="mono" href="{{ url_for('admin_test_fetch') }}?admin_secret={{ asec }}&key={{ m['input_key'] }}&quantity=1" target="_blank">Test fetch</a>
+            <a class="mono" href="{{ url_for('fetch') }}?key={{ m['input_key'] }}&quantity=1" target="_blank">Test fetch</a>
           </td>
           <td><a class="btn red" href="{{ url_for('admin_delete_key') }}?admin_secret={{ asec }}&id={{ m['id'] }}" onclick="return confirm('Xoá key {{ m['input_key'] }}?')">Xoá</a></td>
         </tr>
