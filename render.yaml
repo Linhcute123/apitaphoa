@@ -1,16 +1,16 @@
 services:
   - type: web
-    name: taphoa-multi-provider-site-apikey-v2
+    name: taphoa-mail72h-direct-perkey
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn app:app -b 0.0.0.0:$PORT"
     envVars:
       - key: ADMIN_SECRET
-        value: adminlinhdz
+        sync: false
+      - key: MAIL72H_BASE
+        value: https://mail72h.com/api
       - key: DB_PATH
-        value: store_profiles.db
-      - key: REQ_TIMEOUT
+        value: store.db
+      - key: MAIL72H_TIMEOUT
         value: "4"
-      - key: DEBUG_ERRORS
-        value: "0"
