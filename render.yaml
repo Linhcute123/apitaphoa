@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: taphoa-multi-site-final
+    name: taphoa-multi-provider-site-apikey-v2
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
@@ -9,8 +9,8 @@ services:
       - key: ADMIN_SECRET
         value: adminlinhdz
       - key: DB_PATH
-        value: store_v2.db
-      - key: MAIL72H_TIMEOUT
+        value: store_profiles.db
+      - key: REQ_TIMEOUT
         value: "4"
       - key: DEBUG_ERRORS
         value: "0"
