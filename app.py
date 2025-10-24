@@ -1,267 +1,104 @@
 
-import os, json, sqlite3
-from contextlib import closing
-from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
-import requests
+import os, json, sqlite3, re, requests
+from flask import Flask, request, jsonify
 
-DB = os.getenv("DB_PATH", "store.db")
-MAIL72H_BASE = os.getenv("MAIL72H_BASE", "https://mail72h.com/api")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
-MAIL72H_TIMEOUT = int(os.getenv("MAIL72H_TIMEOUT", "4"))  # giữ tổng <5s
+DB = os.getenv("DB_PATH", "store_v2.db")
+MAIL_TIMEOUT = 4
+_KEY_CANDIDATES = ("key","api_key","api_keyy")
 
 app = Flask(__name__)
 
 def db():
-    con = sqlite3.connect(DB)
-    con.row_factory = sqlite3.Row
-    return con
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
 
-def init_db():
-    with db() as con:
-        con.execute("""
-        CREATE TABLE IF NOT EXISTS keymaps(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sku TEXT NOT NULL,
-            input_key TEXT NOT NULL UNIQUE,
-            product_id INTEGER NOT NULL,
-            mail72h_api_key TEXT NOT NULL,
-            note TEXT,
-            is_active INTEGER DEFAULT 1
-        )""")
-        con.commit()
+def _bases_to_try(base):
+    base = base.rstrip("/")
+    return [base, base+"/api"] if not base.endswith("/api") else [base]
 
-init_db()
+def _http_get_json(url,params):
+    r=requests.get(url,params=params,timeout=MAIL_TIMEOUT);r.raise_for_status();return r.json()
+def _http_post_json(url,data):
+    r=requests.post(url,data=data,timeout=MAIL_TIMEOUT);r.raise_for_status();return r.json()
 
-# ========= Mail72h helpers (per-key API) =========
-def mail72h_buy(api_key: str, product_id: int, amount: int, coupon: str|None=None) -> dict:
-    data = {
-        "action": "buyProduct",
-        "id": product_id,
-        "amount": amount,
-        "api_key": api_key
-    }
-    if coupon:
-        data["coupon"] = coupon
-    r = requests.post(f"{MAIL72H_BASE}/buy_product", data=data, timeout=MAIL72H_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+def _extract_int(v):
+    if isinstance(v,(int,float)):return int(v)
+    if not v:return None
+    m=re.search(r"\d+",str(v))
+    return int(m.group(0)) if m else None
 
-def mail72h_product_detail(api_key: str, product_id: int) -> dict:
-    r = requests.get(f"{MAIL72H_BASE}/product.php",
-                     params={"api_key": api_key, "id": product_id},
-                     timeout=MAIL72H_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+def _deep_find_stock(o):
+    keys={'stock','quantity','qty','remain','available','tonkho','soluong','so_luong','left'}
+    if isinstance(o,dict):
+        for k,v in o.items():
+            if k.lower() in keys:
+                n=_extract_int(v)
+                if n is not None:return n
+            n=_deep_find_stock(v)
+            if n is not None:return n
+    if isinstance(o,list):
+        for it in o:
+            n=_deep_find_stock(it)
+            if n is not None:return n
+    return None
 
-def find_map_by_key(key: str):
-    with db() as con:
-        row = con.execute("SELECT * FROM keymaps WHERE input_key=? AND is_active=1", (key,)).fetchone()
-        return row
+def provider_stock(base,api_key,pid):
+    for b in _bases_to_try(base):
+        for key in _KEY_CANDIDATES:
+            try:
+                data=_http_get_json(f"{b}/product.php",{key:api_key,"id":pid})
+                n=_deep_find_stock(data)
+                if n is not None:return n
+            except:pass
+    for b in _bases_to_try(base):
+        for key in _KEY_CANDIDATES:
+            try:
+                data=_http_get_json(f"{b}/products.php",{key:api_key})
+                items=[]
+                if isinstance(data,dict):
+                    for k in ("data","products","items","result"):
+                        if isinstance(data.get(k),list):items=data[k];break
+                elif isinstance(data,list):items=data
+                for it in items:
+                    if str(it.get("id") or it.get("product_id"))==str(pid):
+                        n=_deep_find_stock(it)
+                        if n is not None:return n
+            except:pass
+    raise Exception("no stock info")
 
-# ========= Admin UI =========
-ADMIN_TPL = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8" />
-<title>Direct mode: per-key API + đúng kho</title>
-<style>
-  body { font-family: system-ui, Arial; padding: 24px; }
-  table { border-collapse: collapse; width: 100%; margin-top: 16px; }
-  th, td { border:1px solid #ddd; padding:8px; }
-  th { background:#f5f5f5; text-align:left; }
-  input[type=text], input[type=number], input[type=password] { width: 100%; padding:6px; }
-  .row { display:flex; gap:12px; flex-wrap:wrap; }
-  .card { border:1px solid #ddd; padding:16px; border-radius:8px; margin-bottom:16px; }
-  .btn { padding:8px 12px; border:1px solid #333; background:#fff; cursor:pointer; }
-  .btn.primary { background:#111; color:#fff; }
-  code { background:#f4f4f4; padding:2px 4px; border-radius:4px; }
-  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-</style>
-</head>
-<body>
-  <h2>Direct: lấy hàng thẳng từ mail72h (mỗi key có API key riêng)</h2>
-  <div class="card">
-    <h3>Thêm/Cập nhật key</h3>
-    <form method="post" action="{{ url_for('admin_add_keymap') }}?admin_secret={{ admin_secret }}">
-      <div class="row">
-        <div style="flex:1 1 140px">
-          <label>SKU</label>
-          <input type="text" name="sku" required placeholder="vd: edu24h">
-        </div>
-        <div style="flex:2 1 240px">
-          <label>input_key (Tạp Hóa)</label>
-          <input class="mono" type="text" name="input_key" required placeholder="key-abc">
-        </div>
-        <div style="flex:1 1 140px">
-          <label>product_id (mail72h)</label>
-          <input class="mono" type="number" name="product_id" required placeholder="12345">
-        </div>
-        <div style="flex:2 1 260px">
-          <label>API key (mail72h) cho key này</label>
-          <input class="mono" type="password" name="api_key" required placeholder="paste API key">
-        </div>
-        <div style="flex:3 1 320px">
-          <label>Ghi chú</label>
-          <input type="text" name="note" placeholder="tuỳ chọn">
-        </div>
-      </div>
-      <button class="btn primary" type="submit">Thêm / Cập nhật</button>
-    </form>
-  </div>
-
-  <h3>Key ↔ product_id (mỗi key có API key riêng)</h3>
-  <table>
-    <thead><tr><th>SKU</th><th>input_key</th><th>product_id</th><th>API key (ẩn)</th><th>Active</th><th>Ghi chú</th><th>Hành động</th></tr></thead>
-    <tbody>
-    {% for m in maps %}
-      <tr>
-        <td>{{ m['sku'] }}</td>
-        <td><code>{{ m['input_key'] }}</code></td>
-        <td>{{ m['product_id'] }}</td>
-        <td>••••••••</td>
-        <td>{{ m['is_active'] }}</td>
-        <td>{{ m['note'] or '' }}</td>
-        <td>
-          <form method="post" action="{{ url_for('admin_toggle_key', kmid=m['id']) }}?admin_secret={{ admin_secret }}" style="display:inline">
-            <button class="btn" type="submit">{{ 'Disable' if m['is_active'] else 'Enable' }}</button>
-          </form>
-          <form method="post" action="{{ url_for('admin_delete_key', kmid=m['id']) }}?admin_secret={{ admin_secret }}" style="display:inline" onsubmit="return confirm('Xoá key {{m['input_key']}}?')">
-            <button class="btn" type="submit">Xoá</button>
-          </form>
-        </td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
-
-  <h3>Endpoint cho Tạp Hóa</h3>
-  <pre>
-Tồn kho (đọc trực tiếp từ mail72h → khớp số lượng):
-  GET /stock?key=&lt;input_key&gt;
-
-Lấy hàng (mua trực tiếp từ mail72h):
-  GET /fetch?key=&lt;input_key&gt;&order_id={order_id}&quantity={quantity}
-  </pre>
-</body>
-</html>
-"""
-
-def require_admin():
-    if request.args.get("admin_secret") != ADMIN_SECRET:
-        abort(403)
-
-@app.route("/admin")
-def admin_index():
-    require_admin()
-    with db() as con:
-        maps = con.execute("SELECT * FROM keymaps ORDER BY sku, id").fetchall()
-    return render_template_string(ADMIN_TPL, maps=maps, admin_secret=ADMIN_SECRET)
-
-@app.route("/admin/keymap", methods=["POST"])
-def admin_add_keymap():
-    require_admin()
-    sku = request.form.get("sku","").strip()
-    input_key = request.form.get("input_key","").strip()
-    product_id = request.form.get("product_id","").strip()
-    api_key = request.form.get("api_key","").strip()
-    note = request.form.get("note","").strip()
-    if not sku or not input_key or not product_id.isdigit() or not api_key:
-        abort(400)
-    with db() as con:
-        con.execute("""
-            INSERT INTO keymaps(sku, input_key, product_id, mail72h_api_key, note, is_active)
-            VALUES(?,?,?,?,?,1)
-            ON CONFLICT(input_key) DO UPDATE SET
-              sku=excluded.sku,
-              product_id=excluded.product_id,
-              mail72h_api_key=excluded.mail72h_api_key,
-              note=excluded.note,
-              is_active=1
-        """, (sku, input_key, int(product_id), api_key, note))
-        con.commit()
-    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
-
-@app.route("/admin/keymap/<int:kmid>/toggle", methods=["POST"])
-def admin_toggle_key(kmid):
-    require_admin()
-    with db() as con:
-        row = con.execute("SELECT is_active FROM keymaps WHERE id=?", (kmid,)).fetchone()
-        if not row: abort(404)
-        newv = 0 if row["is_active"] else 1
-        con.execute("UPDATE keymaps SET is_active=? WHERE id=?", (newv, kmid))
-        con.commit()
-    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
-
-@app.route("/admin/keymap/<int:kmid>", methods=["POST"])
-def admin_delete_key(kmid):
-    require_admin()
-    with db() as con:
-        con.execute("DELETE FROM keymaps WHERE id=?", (kmid,))
-        con.commit()
-    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
-
-# ========= Public endpoints =========
 @app.route("/stock")
 def stock():
-    key = request.args.get("key","").strip()
-    if not key:
-        return jsonify({"status":"error","msg":"missing key"}), 400
-    row = find_map_by_key(key)
-    if not row:
-        return jsonify({"status":"error","msg":"unknown key"}), 404
-    # đọc kho thực từ mail72h
+    key=request.args.get("key")
+    if not key:return jsonify({"status":"error","msg":"missing key"}),400
+    with db() as c:
+        km=c.execute("SELECT k.*,s.base_url FROM keymaps k JOIN sites s ON s.id=s.id WHERE k.input_key=?",(key,)).fetchone()
+    if not km:return jsonify({"status":"error","msg":"unknown key"}),404
     try:
-        pd = mail72h_product_detail(row["mail72h_api_key"], int(row["product_id"]))
-        # tuỳ cấu trúc JSON của mail72h, bạn có thể cần đổi chỗ lấy số tồn:
-        stock_val = int(pd.get("data", {}).get("stock", 0))
+        s=provider_stock(km["base_url"],km["provider_api_key"],km["product_id"])
+        return jsonify({"sum":int(s)})
     except Exception as e:
-        # Nếu API không trả tồn kho, fallback về số lớn để không chặn bán
-        stock_val = 9999
-    return jsonify({"sum": stock_val})
+        return jsonify({"status":"error","msg":str(e)}),502
 
 @app.route("/fetch")
 def fetch():
-    key = request.args.get("key","").strip()
-    order_id = request.args.get("order_id","").strip()
-    qty_s = request.args.get("quantity","").strip()
-    if not key or not qty_s:
-        return jsonify({"status":"error","msg":"missing key/quantity"}), 400
-    try:
-        qty = int(qty_s); 
-        if qty<=0 or qty>1000: raise ValueError()
-    except Exception:
-        return jsonify({"status":"error","msg":"invalid quantity"}), 400
-
-    row = find_map_by_key(key)
-    if not row:
-        return jsonify({"status":"error","msg":"unknown key"}), 404
-
-    try:
-        res = mail72h_buy(row["mail72h_api_key"], int(row["product_id"]), qty)
-    except requests.HTTPError as e:
-        code = e.response.status_code if e.response is not None else 502
-        return jsonify({"status":"error","msg":f"mail72h http {code}"}), 502
-    except Exception as e:
-        return jsonify({"status":"error","msg":f"mail72h error: {e}"}), 502
-
-    if res.get("status") != "success":
-        return jsonify({"status":"error","msg":res}), 409
-
-    data = res.get("data")
-    out = []
-    if isinstance(data, list):
-        for it in data:
-            out.append({"product": (json.dumps(it, ensure_ascii=False) if isinstance(it, dict) else str(it))})
-    else:
-        t = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
-        out = [{"product": t} for _ in range(qty)]
-    return jsonify(out)
+    key=request.args.get("key");qty=request.args.get("quantity","1");oid=request.args.get("order_id","")
+    if not key:return jsonify({"status":"error","msg":"missing key"}),400
+    try:qty=int(qty)
+    except:return jsonify({"status":"error","msg":"bad quantity"}),400
+    with db() as c:
+        km=c.execute("SELECT k.*,s.base_url FROM keymaps k JOIN sites s ON s.id=s.id WHERE k.input_key=?",(key,)).fetchone()
+    if not km:return jsonify({"status":"error","msg":"unknown key"}),404
+    for b in _bases_to_try(km["base_url"]):
+        for k in _KEY_CANDIDATES:
+            try:
+                r=_http_post_json(f"{b}/buy_product",{"action":"buyProduct","id":km["product_id"],"amount":qty,k:km["provider_api_key"]})
+                return jsonify(r)
+            except:pass
+    return jsonify({"status":"error","msg":"buy failed"}),502
 
 @app.route("/")
-def health():
-    return "OK", 200
+def root():return "OK",200
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=8000)
