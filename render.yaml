@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: taphoa-mail72h-direct-perkey
+    name: taphoa-mail72h
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
