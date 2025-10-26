@@ -1,16 +1,16 @@
 services:
   - type: web
-    name: taphoa-mail72h
+    name: apitaphoavip
     env: python
     plan: free
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn app:app -b 0.0.0.0:$PORT"
     envVars:
       - key: ADMIN_SECRET
-        sync: false
-      - key: MAIL72H_BASE
-        value: https://mail72h.com/api
+        value: adminlinhdz
       - key: DB_PATH
-        value: store.db
-      - key: MAIL72H_TIMEOUT
-        value: "4"
+        value: store_profiles.db
+      - key: REQ_TIMEOUT
+        value: "3"
+      - key: DEBUG_ERRORS
+        value: "0"
