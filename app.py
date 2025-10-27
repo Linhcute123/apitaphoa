@@ -1,6 +1,6 @@
 import os, json, sqlite3
 from contextlib import closing
-# === MỚI: Thêm 'request' để đọc cookies ===
+# Import 'request' để đọc cookies
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
 import datetime 
@@ -254,7 +254,6 @@ label{
     margin-bottom: 4px;
     display: block;
 }
-/* === MỚI: Thêm 'select' vào rule này === */
 input, select {
     width: 100%;
     padding: 10px 14px;
@@ -263,7 +262,6 @@ input, select {
     box-sizing: border-box;
     transition: border-color .2s, box-shadow .2s;
 }
-/* === MỚI: Thêm 'select' vào rule này === */
 input:focus, select:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(13,110,253,0.25);
@@ -332,17 +330,6 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
 <body>
   <h2>⚙️ Multi-Provider (Quản lý theo Website)</h2>
   
-  <div class="card" style="padding: 16px;">
-    <div class="row" style="align-items: center;">
-      <div class="col-4">
-        <label for="theme-switcher">Chọn Giao Diện</label>
-        <select id="theme-switcher" class="mono">
-          <option value="default" {% if theme == 'default' %}selected{% endif %}>Mặc định</option>
-          <option value="snow" {% if theme == 'snow' %}selected{% endif %}>Hiệu ứng Tuyết Rơi ❄️</option>
-        </select>
-      </div>
-    </div>
-  </div>
   <div class="card" id="add-key-form-card">
     <h3>Thêm/Update Key</h3>
     <form method="post" action="{{ url_for('admin_add_keymap') }}?admin_secret={{ asec }}" id="main-key-form">
@@ -437,6 +424,19 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
     {% endfor %}
   </div>
 
+  <div class="card" style="padding: 16px;">
+    <div class="row" style="align-items: center;">
+      <div class="col-4">
+        <label for="theme-switcher">Chọn Giao Diện</label>
+        <select id="theme-switcher" class="mono">
+          <option value="default" {% if theme == 'default' %}selected{% endif %}>Mặc định</option>
+          <option value="snow" {% if theme == 'snow' %}selected{% endif %}>Tuyết Rơi ❄️</option>
+          <option value="matrix" {% if theme == 'matrix' %}selected{% endif %}>Matrix (Ma Trận 💻)</option>
+          <option value="sakura" {% if theme == 'sakura' %}selected{% endif %}>Hoa Anh Đào 🌸</option>
+        </select>
+      </div>
+    </div>
+  </div>
   <div class="card">
     <h3>Backup & Đồng bộ</h3>
     <div class="row">
@@ -519,14 +519,10 @@ document.getElementById('reset-form-btn').addEventListener('click', function() {
     setLockedFields(false);
 });
 
-// ==========================================================
-// === MỚI: Logic cho Theme Switcher ===
-// ==========================================================
+// Logic cho Theme Switcher
 document.getElementById('theme-switcher').addEventListener('change', function() {
     const selectedTheme = this.value;
-    // Lưu vào cookie, hết hạn sau 1 năm
     document.cookie = `admin_theme=${selectedTheme};path=/;max-age=31536000;SameSite=Lax`;
-    // Tải lại trang để áp dụng
     location.reload();
 });
 </script>
@@ -534,8 +530,7 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
 {% if theme == 'snow' %}
 <script id="snow-effect-script">
 (function() {
-    if (document.getElementById('snow-canvas')) return; // Đã chạy rồi
-
+    if (document.getElementById('snow-canvas')) return; 
     var canvas = document.createElement('canvas');
     canvas.id = 'snow-canvas';
     canvas.style.position = 'fixed';
@@ -548,13 +543,12 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
     document.body.appendChild(canvas);
 
     var ctx = canvas.getContext('2d');
-    var flakes = [];
     var W = window.innerWidth;
     var H = window.innerHeight;
     canvas.width = W;
     canvas.height = H;
     var mp = 100; // max particles
-
+    var flakes = [];
     for(var i = 0; i < mp; i++) {
         flakes.push({
             x: Math.random() * W, // x-coordinate
@@ -563,7 +557,6 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
             d: Math.random() * mp // density
         });
     }
-
     function draw() {
         ctx.clearRect(0, 0, W, H);
         ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
@@ -576,7 +569,6 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
         ctx.fill();
         update();
     }
-
     var angle = 0;
     function update() {
         angle += 0.01;
@@ -584,7 +576,6 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
             var f = flakes[i];
             f.y += Math.cos(angle + f.d) + 1 + f.r / 2;
             f.x += Math.sin(angle) * 2;
-
             if(f.x > W + 5 || f.x < -5 || f.y > H) {
                 if(i % 3 > 0) { 
                     flakes[i] = {x: Math.random() * W, y: -10, r: f.r, d: f.d};
@@ -598,14 +589,139 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
             }
         }
     }
-    
     var snowInterval = setInterval(draw, 33);
-
     window.addEventListener('resize', function() {
-        W = window.innerWidth;
-        H = window.innerHeight;
-        canvas.width = W;
-        canvas.height = H;
+        W = window.innerWidth; H = window.innerHeight;
+        canvas.width = W; canvas.height = H;
+    });
+})();
+</script>
+{% endif %}
+
+{% if theme == 'matrix' %}
+<script id="matrix-effect-script">
+(function() {
+    if (document.getElementById('matrix-canvas')) return;
+    var canvas = document.createElement('canvas');
+    canvas.id = 'matrix-canvas';
+    canvas.style.position = 'fixed';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.width = '100vw';
+    canvas.style.height = '100vh';
+    canvas.style.pointerEvents = 'none';
+    canvas.style.zIndex = '9999';
+    document.body.appendChild(canvas);
+    
+    var ctx = canvas.getContext('2d');
+    var W = window.innerWidth;
+    var H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+
+    var font_size = 14;
+    var columns = Math.floor(W / font_size);
+    var drops = [];
+    for(var x = 0; x < columns; x++) drops[x] = 1; 
+    var chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890@#$%^&*()";
+    chars = chars.split("");
+
+    function draw() {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.05)"; 
+        ctx.fillRect(0, 0, W, H);
+        
+        ctx.fillStyle = "#0F0"; // Green color
+        ctx.font = font_size + "px monospace";
+
+        for(var i = 0; i < drops.length; i++) {
+            var text = chars[Math.floor(Math.random() * chars.length)];
+            ctx.fillText(text, i * font_size, drops[i] * font_size);
+            
+            if(drops[i] * font_size > H && Math.random() > 0.975) {
+                drops[i] = 0;
+            }
+            drops[i]++;
+        }
+    }
+    var matrixInterval = setInterval(draw, 40);
+    window.addEventListener('resize', function() {
+        W = window.innerWidth; H = window.innerHeight;
+        canvas.width = W; canvas.height = H;
+        columns = Math.floor(W / font_size);
+        drops = [];
+        for(var x = 0; x < columns; x++) drops[x] = 1; 
+    });
+})();
+</script>
+{% endif %}
+
+{% if theme == 'sakura' %}
+<script id="sakura-effect-script">
+(function() {
+    if (document.getElementById('sakura-canvas')) return; 
+    var canvas = document.createElement('canvas');
+    canvas.id = 'sakura-canvas';
+    canvas.style.position = 'fixed';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.width = '100vw';
+    canvas.style.height = '100vh';
+    canvas.style.pointerEvents = 'none';
+    canvas.style.zIndex = '9999';
+    document.body.appendChild(canvas);
+
+    var ctx = canvas.getContext('2d');
+    var W = window.innerWidth;
+    var H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    var mp = 75; // Ít hoa hơn tuyết
+    var petals = [];
+    for(var i = 0; i < mp; i++) {
+        petals.push({
+            x: Math.random() * W,
+            y: Math.random() * H,
+            r: Math.random() * 4 + 1,
+            d: Math.random() * mp,
+            c: (Math.random() > 0.5) ? "rgba(255, 192, 203, 0.8)" : "rgba(255, 255, 255, 0.8)" // Pink or White
+        });
+    }
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        for(var i = 0; i < mp; i++) {
+            var p = petals[i];
+            ctx.fillStyle = p.c;
+            ctx.beginPath();
+            ctx.moveTo(p.x, p.y);
+            ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2, true);
+            ctx.fill();
+        }
+        update();
+    }
+    var angle = 0;
+    function update() {
+        angle += 0.01;
+        for(var i = 0; i < mp; i++) {
+            var p = petals[i];
+            p.y += Math.cos(angle + p.d) + 1 + p.r / 2;
+            p.x += Math.sin(angle) * 2;
+            if(p.x > W + 5 || p.x < -5 || p.y > H) {
+                if(i % 3 > 0) { 
+                    petals[i] = {x: Math.random() * W, y: -10, r: p.r, d: p.d, c: p.c};
+                } else {
+                    if(Math.sin(angle) > 0) {
+                        petals[i] = {x: -5, y: Math.random() * H, r: p.r, d: p.d, c: p.c};
+                    } else {
+                        petals[i] = {x: W + 5, y: Math.random() * H, r: p.r, d: p.d, c: p.c};
+                    }
+                }
+            }
+        }
+    }
+    var sakuraInterval = setInterval(draw, 33);
+    window.addEventListener('resize', function() {
+        W = window.innerWidth; H = window.innerHeight;
+        canvas.width = W; canvas.height = H;
     });
 })();
 </script>
@@ -641,7 +757,7 @@ def admin_index():
         
         grouped_data[folder][provider]["key_list"].append(key)
 
-    # === MỚI: Đọc cookie theme và truyền vào template ===
+    # Đọc cookie theme và truyền vào template
     theme = request.cookies.get('admin_theme', 'default')
     return render_template_string(ADMIN_TPL, grouped_data=grouped_data, asec=ADMIN_SECRET, theme=theme)
 
@@ -710,7 +826,7 @@ def admin_backup_download():
         
         data_to_export = [dict(row) for row in maps]
         
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Ym%d_%H%M%S")
         filename = f"keymaps_backup_{timestamp}.json"
         
         response = jsonify(data_to_export)
