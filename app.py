@@ -51,6 +51,17 @@ def init_db():
 
 init_db()
 
+# ----------------- Backup DB (download) -----------------
+from flask import send_file
+
+@app.get("/backup")
+def backup():
+    require_admin()
+    fname = os.path.basename(DB) if os.path.basename(DB) else "store.db"
+    return send_file(DB, as_attachment=True, download_name=fname)
+# --------------------------------------------------------
+
+
 # ==========================================================
 # === SỬA LỖI 6: Thu thập TẤT CẢ sản phẩm từ TẤT CẢ danh mục ===
 # ==========================================================
@@ -243,7 +254,7 @@ details details summary { background: #f3f4f6; }
 </style>
 </head>
 <body>
-  <h2>⚙️ Multi-Provider (Quản lý theo Folder)</h2><div style='margin:10px 0 18px 0'><a class='btn green' href='{{ url_for("verify_backup") }}?admin_secret={{ asec }}'>🔍 Kiểm tra backup</a> <a class='btn' href='{{ url_for("export_json") }}?admin_secret={{ asec }}'>📤 Export JSON</a> <a class='btn' href='{{ url_for("export_csv") }}?admin_secret={{ asec }}'>📤 Export CSV</a> <a class='btn' href='{{ url_for("backup") }}?admin_secret={{ asec }}'>⬇️ Tải backup</a> <a class='btn gray' href='{{ url_for("restore_form") }}?admin_secret={{ asec }}'>⬆️ Upload/Restore</a></div>
+  <h2>⚙️ Multi-Provider (Quản lý theo Folder)</h2>
   
   <div class="card" id="add-key-form-card">
     <h3>Thêm/Update Key</h3>
@@ -285,7 +296,7 @@ details details summary { background: #f3f4f6; }
         <div class="content">
           {% for provider, data in providers.items() %}
             <details class="provider">
-              <summary>📦 Provider: {{ provider }} {% if data['base_url'] %}<a class="mono" href="{{ data['base_url'] }}" target="_blank">(mở web)</a>{% endif %} ({{ data.key_list|length }} keys)</summary>
+              <summary>📦 Provider: {{ provider }} ({{ data.key_list|length }} keys)</summary>
               <div class="content">
                 <table>
                   <thead>
@@ -475,9 +486,11 @@ def stock():
 
     provider = row['provider_type']
     
-    if provider == 'mail72h' or True:
-        # Fallback: treat unknown providers as mail72h-compatible using base_url/api_key
+    if provider == 'mail72h':
         return stock_mail72h(row)
+    else:
+        print(f"STOCK_ERROR: Provider '{provider}' not supported")
+        return jsonify({"sum": 0}), 200
 
 
 @app.route("/fetch")
@@ -502,9 +515,11 @@ def fetch():
     
     provider = row['provider_type']
 
-    if provider == 'mail72h' or True:
-        # Fallback: treat unknown providers as mail72h-compatible
+    if provider == 'mail72h':
         return fetch_mail72h(row, qty)
+    else:
+        print(f"FETCH_ERROR: Provider '{provider}' not supported")
+        return jsonify([]), 200
 
 @app.route("/")
 def health():
@@ -547,54 +562,3 @@ def debug_list_products():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
-
-
-# ----------------- Verify & Export -----------------
-import hashlib, csv, io
-
-def _sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024*256), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-@app.get("/admin/verify_backup")
-def verify_backup():
-    require_admin()
-    # live DB stats
-    live = {"db_path": DB}
-    try:
-        with closing(db()) as con:
-            live_count = con.execute("SELECT COUNT(*) FROM keymaps").fetchone()[0]
-            live["keymaps"] = live_count
-    except Exception as e:
-        live["error"] = str(e)
-        live["keymaps"] = None
-    live["sha256"] = _sha256_file(DB)
-    return jsonify({"live": live, "download": url_for("backup", _external=False) + f"?admin_secret={ADMIN_SECRET}"})
-
-@app.get("/admin/export.json")
-def export_json():
-    require_admin()
-    with closing(db()) as con:
-        rows = con.execute("SELECT * FROM keymaps ORDER BY id").fetchall()
-        data = [dict(r) for r in rows]
-    return jsonify({"rows": data, "count": len(data)})
-
-@app.get("/admin/export.csv")
-def export_csv():
-    require_admin()
-    output = io.StringIO()
-    writer = None
-    with closing(db()) as con:
-        cur = con.execute("SELECT * FROM keymaps ORDER BY id")
-        cols = [d[0] for d in cur.description]
-        writer = csv.writer(output)
-        writer.writerow(cols)
-        for r in cur:
-            writer.writerow([r[c] for c in cols])
-    resp = app.response_class(output.getvalue(), mimetype="text/csv")
-    resp.headers["Content-Disposition"] = "attachment; filename=keymaps.csv"
-    return resp
-# ---------------------------------------------------
