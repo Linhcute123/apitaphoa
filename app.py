@@ -85,7 +85,7 @@ def _collect_all_products(obj):
 # ==========================================================
 
 
-# ========= Helpers cho Provider 'mail72h' (Vẫn dùng tên này, nhưng nó dùng chung) =========
+# ========= Helpers cho Provider 'mail72h' =========
 
 def mail72h_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
     data = {"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}
@@ -104,7 +104,6 @@ def mail72h_product_list(base_url: str, api_key: str) -> dict:
 
 def stock_mail72h(row):
     try:
-        # Tự động lấy base_url từ CSDL. Nếu không set, mặc định là mail72h.com
         base_url = row['base_url'] or 'https://mail72h.com'
         # Đây là ID từ CSDL của bạn (ví dụ: "28")
         pid_to_find_str = str(row["product_id"])
@@ -177,7 +176,6 @@ def stock_mail72h(row):
 
 def fetch_mail72h(row, qty):
     try:
-        # Tự động lấy base_url từ CSDL. Nếu không set, mặc định là mail72h.com
         base_url = row['base_url'] or 'https://mail72h.com'
         res = mail72h_buy(base_url, row["api_key"], int(row["product_id"]), qty)
     
@@ -245,7 +243,7 @@ details details summary { background: #f3f4f6; }
 </style>
 </head>
 <body>
-  <h2>⚙️ Multi-Provider (Quản lý theo Folder)</h2>
+  <h2>⚙️ Multi-Provider (Quản lý theo Folder)</h2><div style='margin:10px 0 18px 0'><a class='btn green' href='{{ url_for("verify_backup") }}?admin_secret={{ asec }}'>🔍 Kiểm tra backup</a> <a class='btn' href='{{ url_for("export_json") }}?admin_secret={{ asec }}'>📤 Export JSON</a> <a class='btn' href='{{ url_for("export_csv") }}?admin_secret={{ asec }}'>📤 Export CSV</a> <a class='btn' href='{{ url_for("backup") }}?admin_secret={{ asec }}'>⬇️ Tải backup</a> <a class='btn gray' href='{{ url_for("restore_form") }}?admin_secret={{ asec }}'>⬆️ Upload/Restore</a></div>
   
   <div class="card" id="add-key-form-card">
     <h3>Thêm/Update Key</h3>
@@ -257,7 +255,7 @@ details details summary { background: #f3f4f6; }
         </div>
         <div class="col-3">
           <label>Provider Type</label>
-          <input class="mono" name="provider_type" value="mail72h" placeholder="vd: my_provider" required>
+          <input class="mono" name="provider_type" value="mail72h" required>
         </div>
         <div class="col-6">
           <label>Base URL (Web đấu API)</label>
@@ -287,7 +285,7 @@ details details summary { background: #f3f4f6; }
         <div class="content">
           {% for provider, data in providers.items() %}
             <details class="provider">
-              <summary>📦 Provider: {{ provider }} ({{ data.key_list|length }} keys) - Base URL: <code>{{ data['base_url'] or 'Chưa set' }}</code></summary>
+              <summary>📦 Provider: {{ provider }} {% if data['base_url'] %}<a class="mono" href="{{ data['base_url'] }}" target="_blank">(mở web)</a>{% endif %} ({{ data.key_list|length }} keys)</summary>
               <div class="content">
                 <table>
                   <thead>
@@ -424,8 +422,8 @@ def admin_add_keymap():
     if not sku or not input_key or not product_id.isdigit() or not api_key:
         return "Thiếu thông tin quan trọng (sku, input_key, product_id, api_key)", 400
     
-    # Bỏ dòng 'if not base_url and provider_type == 'mail72h':'
-    # để nếu base_url rỗng thì nó sẽ là rỗng (và hàm stock/fetch sẽ tự dùng default)
+    if not base_url and provider_type == 'mail72h':
+        base_url = 'https://mail72h.com'
     
     with db() as con:
         con.execute("""
@@ -477,18 +475,9 @@ def stock():
 
     provider = row['provider_type']
     
-    # ==========================================================
-    # === SỬA LỖI: Chấp nhận MỌI provider type ===
-    # ==========================================================
-    # Giả định rằng mọi provider đều dùng chung logic API của 'mail72h'
-    # Code sẽ tự động dùng 'base_url' và 'api_key' đã lưu cho key này.
-    if provider:
-        return stock_mail72h(row) # Hàm này đã dùng base_url trong 'row'
-    else:
-        # Trường hợp này gần như không xảy ra nếu bạn nhập từ admin
-        print(f"STOCK_ERROR: Provider '{provider}' not supported or not set")
-        return jsonify({"sum": 0}), 200
-    # ==========================================================
+    if provider == 'mail72h' or True:
+        # Fallback: treat unknown providers as mail72h-compatible using base_url/api_key
+        return stock_mail72h(row)
 
 
 @app.route("/fetch")
@@ -513,16 +502,9 @@ def fetch():
     
     provider = row['provider_type']
 
-    # ==========================================================
-    # === SỬA LỖI: Chấp nhận MỌI provider type ===
-    # ==========================================================
-    # Giả định rằng mọi provider đều dùng chung logic API của 'mail72h'
-    if provider:
-        return fetch_mail72h(row, qty) # Hàm này đã dùng base_url trong 'row'
-    else:
-        print(f"FETCH_ERROR: Provider '{provider}' not supported or not set")
-        return jsonify([]), 200
-    # ==========================================================
+    if provider == 'mail72h' or True:
+        # Fallback: treat unknown providers as mail72h-compatible
+        return fetch_mail72h(row, qty)
 
 @app.route("/")
 def health():
@@ -545,20 +527,13 @@ def debug_list_products():
     if not row:
         return f"Không tìm thấy key: {key}", 404
     
-    # ==========================================================
-    # === SỬA LỖI: Chấp nhận MỌI provider type ===
-    # ==========================================================
-    # Gỡ bỏ kiểm tra 'if row['provider_type'] != 'mail72h':'
-    # để nó hoạt động với mọi provider
+    if row['provider_type'] != 'mail72h':
+        return f"Key này không dùng provider 'mail72h'", 400
         
     try:
         # 3. Gọi thẳng đến API của nhà cung cấp
-        base_url = row['base_url'] or 'https://mail72h.com' # Tự động dùng base_url đúng
+        base_url = row['base_url'] or 'https://mail72h.com'
         api_key = row["api_key"]
-        
-        if not base_url:
-             return f"Key này (ID: {row['id']}) không có base_url. Vui lòng cập nhật trong admin.", 400
-             
         list_data = mail72h_product_list(base_url, api_key)
         
         # 4. Trả về JSON thô
@@ -572,3 +547,54 @@ def debug_list_products():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
+
+
+# ----------------- Verify & Export -----------------
+import hashlib, csv, io
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024*256), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+@app.get("/admin/verify_backup")
+def verify_backup():
+    require_admin()
+    # live DB stats
+    live = {"db_path": DB}
+    try:
+        with closing(db()) as con:
+            live_count = con.execute("SELECT COUNT(*) FROM keymaps").fetchone()[0]
+            live["keymaps"] = live_count
+    except Exception as e:
+        live["error"] = str(e)
+        live["keymaps"] = None
+    live["sha256"] = _sha256_file(DB)
+    return jsonify({"live": live, "download": url_for("backup", _external=False) + f"?admin_secret={ADMIN_SECRET}"})
+
+@app.get("/admin/export.json")
+def export_json():
+    require_admin()
+    with closing(db()) as con:
+        rows = con.execute("SELECT * FROM keymaps ORDER BY id").fetchall()
+        data = [dict(r) for r in rows]
+    return jsonify({"rows": data, "count": len(data)})
+
+@app.get("/admin/export.csv")
+def export_csv():
+    require_admin()
+    output = io.StringIO()
+    writer = None
+    with closing(db()) as con:
+        cur = con.execute("SELECT * FROM keymaps ORDER BY id")
+        cols = [d[0] for d in cur.description]
+        writer = csv.writer(output)
+        writer.writerow(cols)
+        for r in cur:
+            writer.writerow([r[c] for c in cols])
+    resp = app.response_class(output.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = "attachment; filename=keymaps.csv"
+    return resp
+# ---------------------------------------------------
