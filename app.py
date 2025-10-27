@@ -2,6 +2,7 @@ import os, json, sqlite3
 from contextlib import closing
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
+import datetime # === MỚI: Thêm import này ===
 
 DB = os.getenv("DB_PATH", "store.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
@@ -50,17 +51,6 @@ def init_db():
         con.commit()
 
 init_db()
-
-# ----------------- Backup DB (download) -----------------
-from flask import send_file
-
-@app.get("/backup")
-def backup():
-    require_admin()
-    fname = os.path.basename(DB) if os.path.basename(DB) else "store.db"
-    return send_file(DB, as_attachment=True, download_name=fname)
-# --------------------------------------------------------
-
 
 # ==========================================================
 # === SỬA LỖI 6: Thu thập TẤT CẢ sản phẩm từ TẤT CẢ danh mục ===
@@ -256,6 +246,24 @@ details details summary { background: #f3f4f6; }
 <body>
   <h2>⚙️ Multi-Provider (Quản lý theo Folder)</h2>
   
+  <div class="card">
+    <h3>Backup & Đồng bộ</h3>
+    <div class="row">
+      <div class="col-6">
+        <h4>Tải Backup</h4>
+        <p>Tải xuống toàn bộ cấu hình keys (bảng keymaps) dưới dạng file JSON.</p>
+        <a href="{{ url_for('admin_backup_download') }}?admin_secret={{ asec }}" class="btn green">Tải xuống Backup (.json)</a>
+      </div>
+      <div class="col-6" style="border-left: 1px solid var(--bd); padding-left: 12px;">
+        <h4>Upload (Restore)</h4>
+        <p><strong>CẢNH BÁO:</strong> Thao tác này sẽ <strong style="color:red">XÓA SẠCH</strong> toàn bộ keys hiện tại và thay thế bằng dữ liệu từ file backup.</p>
+        <form method="post" action="{{ url_for('admin_backup_upload') }}?admin_secret={{ asec }}" enctype="multipart/form-data" onsubmit="return confirm('Bạn có chắc chắn muốn XÓA SẠCH keys hiện tại và restore từ file?');">
+          <input type="file" name="backup_file" accept=".json" required>
+          <button type="submit" class="btn red">Upload và Restore</button>
+        </form>
+      </div>
+    </div>
+  </div>
   <div class="card" id="add-key-form-card">
     <h3>Thêm/Update Key</h3>
     <form method="post" action="{{ url_for('admin_add_keymap') }}?admin_secret={{ asec }}" id="main-key-form">
@@ -470,6 +478,93 @@ def admin_delete_key(kmid):
         con.execute("DELETE FROM keymaps WHERE id=?", (kmid,))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
+
+# ==========================================================
+# === MỚI: Thêm 2 route cho Backup và Restore ===
+# ==========================================================
+@app.route("/admin/backup/download")
+def admin_backup_download():
+    require_admin()
+    try:
+        with db() as con:
+            maps = con.execute("SELECT * FROM keymaps").fetchall()
+        
+        # Chuyển đổi list của sqlite3.Row thành list của dict
+        data_to_export = [dict(row) for row in maps]
+        
+        # Tạo tên file
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"keymaps_backup_{timestamp}.json"
+        
+        # Tạo response JSON
+        response = jsonify(data_to_export)
+        # Thiết lập header để trình duyệt tải file về
+        response.headers['Content-Disposition'] = f'attachment; filename={filename}'
+        response.headers['Content-Type'] = 'application/json'
+        return response
+        
+    except Exception as e:
+        print(f"BACKUP_DOWNLOAD_ERROR: {e}")
+        return "Lỗi khi tạo file backup", 500
+
+@app.route("/admin/backup/upload", methods=["POST"])
+def admin_backup_upload():
+    require_admin()
+    
+    if 'backup_file' not in request.files:
+        return "Không tìm thấy file trong request", 400
+    file = request.files['backup_file']
+    if file.filename == '':
+        return "Chưa chọn file", 400
+    
+    if file and file.filename.endswith('.json'):
+        try:
+            # Đọc và parse file JSON
+            file_content = file.read().decode('utf-8')
+            data_to_import = json.loads(file_content)
+            
+            if not isinstance(data_to_import, list):
+                return "Lỗi định dạng JSON: Nội dung file không phải là một danh sách (list).", 400
+            
+            with db() as con:
+                # 1. XÓA SẠCH dữ liệu cũ
+                con.execute("DELETE FROM keymaps")
+                
+                # 2. Thêm dữ liệu mới từ file
+                for item in data_to_import:
+                    con.execute("""
+                        INSERT INTO keymaps(
+                            id, sku, input_key, product_id, is_active, 
+                            group_name, provider_type, base_url, api_key
+                        ) 
+                        VALUES(?,?,?,?,?,?,?,?,?)
+                    """, (
+                        item.get('id'), # Cho phép khôi phục ID cũ
+                        item.get('sku'),
+                        item.get('input_key'),
+                        item.get('product_id'),
+                        item.get('is_active', 1),
+                        item.get('group_name', 'DEFAULT'),
+                        item.get('provider_type', 'mail72h'),
+                        item.get('base_url'),
+                        item.get('api_key')
+                    ))
+                
+                con.commit()
+            
+            return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
+            
+        except json.JSONDecodeError:
+            return "File JSON không hợp lệ. Vui lòng kiểm tra lại.", 400
+        except Exception as e:
+            print(f"BACKUP_UPLOAD_ERROR: {e}")
+            return f"Đã xảy ra lỗi trong quá trình restore: {e}", 500
+    else:
+        return "Loại file không hợp lệ. Vui lòng upload file .json.", 400
+# ==========================================================
+# === KẾT THÚC KHỐI ROUTE MỚI ===
+# ==========================================================
+
 
 # ========= Public endpoints (Bộ định tuyến) =========
 @app.route("/stock")
