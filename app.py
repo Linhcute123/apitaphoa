@@ -287,6 +287,7 @@ button,.btn{
     transition: background-color .2s, transform .1s;
     display: inline-block;
     text-align: center;
+    margin-bottom: 4px; /* === MỚI: Thêm margin để các nút không dính vào nhau === */
 }
 button:hover, .btn:hover {
     filter: brightness(1.1);
@@ -336,7 +337,6 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
           <label>Provider Type</label>
           <input class="mono" name="provider_type" placeholder="vd: mail72h" required>
         </div>
-        
         <div class="col-8">
           <label>Base URL (Web đấu API)</label>
           <input class="mono" name="base_url" placeholder="https://mail72h.com" required>
@@ -387,6 +387,16 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
                       <td>{{ key['product_id'] }}</td>
                       <td>{{ '✅' if key['is_active'] else '❌' }}</td>
                       <td>
+                        <button class="btn gray small edit-key-btn" 
+                                style="display:inline"
+                                data-sku="{{ key['sku'] }}"
+                                data-inputkey="{{ key['input_key'] }}"
+                                data-productid="{{ key['product_id'] }}"
+                                data-apikey="{{ key['api_key'] }}"
+                                data-provider="{{ key['provider_type'] }}"
+                                data-baseurl="{{ key['base_url'] }}">
+                          Sửa ✏️
+                        </button>
                         <form method="post" action="{{ url_for('admin_toggle_key', kmid=key['id']) }}?admin_secret={{ asec }}" style="display:inline">
                           <button class="btn blue small" type="submit">{{ 'Disable' if key['is_active'] else 'Enable' }}</button>
                         </form>
@@ -432,21 +442,17 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
   </div>
 
 <script>
-// === MỚI: CẬP NHẬT JS ĐỂ XÓA LOGIC 'FOLDER' ===
 function setLockedFields(isLocked, provider = '', baseurl = '', apikey = '') {
     const form = document.getElementById('main-key-form');
-    // const folderInput = form.querySelector('input[name="group_name"]'); // Đã xóa
     const providerInput = form.querySelector('input[name="provider_type"]');
     const baseurlInput = form.querySelector('input[name="base_url"]');
     const apikeyInput = form.querySelector('input[name="api_key"]');
 
-    // folderInput.readOnly = isLocked; // Đã xóa
     providerInput.readOnly = isLocked;
     baseurlInput.readOnly = isLocked;
     apikeyInput.readOnly = isLocked;
 
     if (isLocked) {
-        // folderInput.value = folder; // Đã xóa
         providerInput.value = provider;
         baseurlInput.value = baseurl;
         apikeyInput.value = apikey;
@@ -454,23 +460,58 @@ function setLockedFields(isLocked, provider = '', baseurl = '', apikey = '') {
 }
 
 document.addEventListener('click', function(e) {
+  // Logic cho nút "+ Thêm Key vào đây"
   if (e.target.classList.contains('add-key-helper')) {
     e.preventDefault();
-    // const folder = e.target.dataset.folder; // Đã xóa
     const provider = e.target.dataset.provider;
     const baseurl = e.target.dataset.baseurl;
     const apikey = e.target.dataset.apikey; 
     
-    setLockedFields(true, provider, baseurl, apikey); // Đã xóa 'folder'
+    setLockedFields(true, provider, baseurl, apikey); 
+    
+    // Xóa các trường dữ liệu key cũ
+    const form = document.getElementById('main-key-form');
+    form.querySelector('input[name="sku"]').value = '';
+    form.querySelector('input[name="input_key"]').value = '';
+    form.querySelector('input[name="product_id"]').value = '';
     
     const formCard = document.getElementById('add-key-form-card');
     formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
     formCard.querySelector('input[name="sku"]').focus();
   }
+
+  // ==========================================================
+  // === MỚI: Logic cho nút "Sửa ✏️" ===
+  // ==========================================================
+  if (e.target.classList.contains('edit-key-btn')) {
+    e.preventDefault();
+    
+    // 1. Mở khóa tất cả các trường
+    setLockedFields(false);
+
+    // 2. Điền dữ liệu từ key vào form
+    const form = document.getElementById('main-key-form');
+    form.querySelector('input[name="provider_type"]').value = e.target.dataset.provider;
+    form.querySelector('input[name="base_url"]').value = e.target.dataset.baseurl;
+    form.querySelector('input[name="sku"]').value = e.target.dataset.sku;
+    form.querySelector('input[name="input_key"]').value = e.target.dataset.inputkey;
+    form.querySelector('input[name="product_id"]').value = e.target.dataset.productid;
+    form.querySelector('input[name="api_key"]').value = e.target.dataset.apikey;
+
+    // 3. Cuộn lên form và focus
+    const formCard = document.getElementById('add-key-form-card');
+    formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    formCard.querySelector('input[name="sku"]').focus();
+  }
+  // ==========================================================
+  
 });
 
+// Logic cho nút "Xóa form"
 document.getElementById('reset-form-btn').addEventListener('click', function() {
+    // Mở khóa các trường khi reset
     setLockedFields(false);
+    // (Trình duyệt sẽ tự động xóa nội dung do type="reset")
 });
 </script>
 </body></html>
@@ -511,26 +552,18 @@ def admin_add_keymap():
     require_admin()
     f = request.form
     
-    # === MỚI: ĐÃ XÓA 'group_name' khỏi form ===
-    # group_name = f.get("group_name","").strip() or 'DEFAULT'
     sku = f.get("sku","").strip()
     input_key = f.get("input_key","").strip()
     product_id = f.get("product_id","").strip()
     
-    provider_type = f.get("provider_type","").strip().lower() # Bỏ mặc định 'mail72h'
+    provider_type = f.get("provider_type","").strip().lower() 
     base_url = f.get("base_url","").strip()
     api_key = f.get("api_key","").strip()
     
-    # === MỚI: LẤY 'group_name' TỪ 'base_url' ===
     group_name = base_url
     
-    # === MỚI: CẬP NHẬT VALIDATION ===
     if not sku or not input_key or not product_id.isdigit() or not api_key or not provider_type or not base_url:
         return "Thiếu thông tin quan trọng (sku, input_key, product_id, api_key, provider_type, base_url)", 400
-    
-    # === MỚI: ĐÃ XÓA LOGIC MẶC ĐỊNH CỦA BASE_URL (vì giờ là 'required') ===
-    # if not base_url and provider_type == 'mail72h':
-    #     base_url = 'https://mail72h.com'
     
     with db() as con:
         con.execute("""
@@ -577,16 +610,12 @@ def admin_backup_download():
         with db() as con:
             maps = con.execute("SELECT * FROM keymaps").fetchall()
         
-        # Chuyển đổi list của sqlite3.Row thành list của dict
         data_to_export = [dict(row) for row in maps]
         
-        # Tạo tên file
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"keymaps_backup_{timestamp}.json"
         
-        # Tạo response JSON
         response = jsonify(data_to_export)
-        # Thiết lập header để trình duyệt tải file về
         response.headers['Content-Disposition'] = f'attachment; filename={filename}'
         response.headers['Content-Type'] = 'application/json'
         return response
@@ -607,7 +636,6 @@ def admin_backup_upload():
     
     if file and file.filename.endswith('.json'):
         try:
-            # Đọc và parse file JSON
             file_content = file.read().decode('utf-8')
             data_to_import = json.loads(file_content)
             
@@ -615,10 +643,8 @@ def admin_backup_upload():
                 return "Lỗi định dạng JSON: Nội dung file không phải là một danh sách (list).", 400
             
             with db() as con:
-                # 1. XÓA SẠCH dữ liệu cũ
                 con.execute("DELETE FROM keymaps")
                 
-                # 2. Thêm dữ liệu mới từ file
                 for item in data_to_import:
                     con.execute("""
                         INSERT INTO keymaps(
@@ -627,7 +653,7 @@ def admin_backup_upload():
                         ) 
                         VALUES(?,?,?,?,?,?,?,?,?)
                     """, (
-                        item.get('id'), # Cho phép khôi phục ID cũ
+                        item.get('id'), 
                         item.get('sku'),
                         item.get('input_key'),
                         item.get('product_id'),
@@ -651,7 +677,7 @@ def admin_backup_upload():
         return "Loại file không hợp lệ. Vui lòng upload file .json.", 400
 # ==========================================================
 # === KẾT THÚC KHỐI ROUTE MỚI ===
-# =================================G=========
+# ==========================================================
 
 
 # ========= Public endpoints (Bộ định tuyến) =========
@@ -713,10 +739,8 @@ def health():
 # ==========================================================
 @app.route("/debuglist")
 def debug_list_products():
-    # 1. Bảo mật: Yêu cầu admin secret
     require_admin()
     
-    # 2. Lấy key từ URL (ví dụ: ?key=key-abc)
     key = request.args.get("key","").strip()
     if not key:
         return "Vui lòng cung cấp ?key=... (dùng key đang bị lỗi)", 400
@@ -729,12 +753,10 @@ def debug_list_products():
         return f"Key này không dùng provider 'mail72h'", 400
         
     try:
-        # 3. Gọi thẳng đến API của nhà cung cấp
         base_url = row['base_url'] or 'https://mail72h.com'
         api_key = row["api_key"]
         list_data = mail72h_product_list(base_url, api_key)
         
-        # 4. Trả về JSON thô
         return jsonify(list_data)
         
     except Exception as e:
