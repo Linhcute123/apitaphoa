@@ -2,7 +2,7 @@ import os, json, sqlite3
 from contextlib import closing
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
-import datetime # === MỚI: Thêm import này ===
+import datetime # Thêm import này
 
 DB = os.getenv("DB_PATH", "store.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
@@ -216,69 +216,130 @@ ADMIN_TPL = """
 <html><head><meta charset="utf-8" />
 <title>Multi-Provider (Per-Key API)</title>
 <style>
-:root { --bd:#e5e7eb; --bg-light: #f9fafb; }
-body{font-family:system-ui,Arial;padding:28px;color:#111;background:var(--bg-light);}
-.card{border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:18px;background:#fff;}
-.row{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;align-items:end}
-.col-1{grid-column:span 1}.col-2{grid-column:span 2}.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-6{grid-column:span 6}.col-12{grid-column:span 12}
-label{font-size:12px;text-transform:uppercase;color:#444}
-input{width:100%;padding:10px 12px;border:1px solid var(--bd);border-radius:10px;box-sizing:border-box;}
-input:disabled, input[readonly] { background: #f3f4f6; color: #555; cursor: not-allowed; }
-table{width:100%;border-collapse:collapse}
-th,td{padding:10px 12px;border-bottom:1px solid var(--bd);text-align:left;word-break:break-all;}
-code{background:#f3f4f6;padding:2px 6px;border-radius:6px}
-button,.btn{padding:10px 14px;border-radius:10px;border:1px solid #111;background:#111;color:#fff;cursor:pointer;text-decoration:none}
-.btn.red{background:#b91c1c;border-color:#991b1b}
-.btn.blue{background:#2563eb;border-color:#1d4ed8}
-.btn.green{background:#16a34a;border-color:#15803d}
-.btn.gray{background:#6b7280;border-color:#4b5563}
-.btn.small{padding: 5px 10px; font-size: 12px;}
+:root { 
+    --primary: #0d6efd; 
+    --green: #198754; 
+    --red: #dc3545; 
+    --blue: #0d6efd;
+    --gray: #6c757d;
+    --bg-light: #f8f9fa; 
+    --border: #dee2e6;
+    --shadow: 0 4px 12px rgba(0,0,0,0.05);
+    --text-dark: #212529;
+    --text-light: #495057;
+}
+body{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    padding:28px;
+    color: var(--text-dark);
+    background: var(--bg-light);
+    line-height: 1.6;
+}
+.card{
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-bottom: 24px;
+    background: #fff;
+    box-shadow: var(--shadow);
+}
+.row{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;align-items:end}
+.col-1{grid-column:span 1}.col-2{grid-column:span 2}.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-6{grid-column:span 6}.col-8{grid-column:span 8}.col-12{grid-column:span 12}
+label{
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-light);
+    margin-bottom: 4px;
+    display: block;
+}
+input{
+    width: 100%;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-sizing: border-box;
+    transition: border-color .2s, box-shadow .2s;
+}
+input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px rgba(13,110,253,0.25);
+    outline: none;
+}
+input:disabled, input[readonly] { 
+    background: #e9ecef; 
+    color: #6c757d; 
+    cursor: not-allowed; 
+}
+table{width:100%;border-collapse:collapse;margin-top: 10px;}
+th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;word-break:break-all;vertical-align: middle;}
+th { font-size: 12px; text-transform: uppercase; color: var(--text-light); }
+code{background:#e9ecef;padding:3px 6px;border-radius:6px;font-family:monospace;font-size: 0.9em;}
+button,.btn{
+    padding: 10px 16px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: var(--primary);
+    color: #fff;
+    cursor: pointer;
+    text-decoration: none;
+    font-weight: 600;
+    transition: background-color .2s, transform .1s;
+    display: inline-block;
+    text-align: center;
+}
+button:hover, .btn:hover {
+    filter: brightness(1.1);
+    transform: translateY(-1px);
+}
+.btn.red{background:var(--red);border-color:var(--red)}
+.btn.blue{background:var(--blue);border-color:var(--blue)}
+.btn.green{background:var(--green);border-color:var(--green)}
+.btn.gray{background:var(--gray);border-color:var(--gray)}
+.btn.small{padding: 6px 12px; font-size: 13px; font-weight: 500;}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-details { border: 1px solid var(--bd); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
-details summary { padding: 12px 16px; cursor: pointer; font-weight: 600; background: #fff; }
-details[open] summary { border-bottom: 1px solid var(--bd); }
+h2 {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--primary);
+    border-bottom: 2px solid var(--border);
+    padding-bottom: 10px;
+    margin-bottom: 20px;
+}
+h3 { margin-top: 0; margin-bottom: 16px; font-size: 22px; color: var(--text-dark); }
+h4 { margin-top: 0; margin-bottom: 8px; font-size: 18px; color: var(--text-dark); }
+details { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+details summary { 
+    padding: 14px 18px; 
+    cursor: pointer; 
+    font-weight: 600; 
+    background: #fff; 
+    transition: background-color 0.2s;
+    font-size: 1.1em;
+}
+details summary:hover { background-color: #fcfcfc; }
+details[open] summary { border-bottom: 1px solid var(--border); background-color: #fdfdfd;}
 details .content { padding: 16px; background: var(--bg-light); }
 details .content .btn { margin-top: 10px; }
 details details { margin-top: 10px; }
-details details summary { background: #f3f4f6; }
+details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
 </style>
 </head>
 <body>
-  <h2>⚙️ Multi-Provider (Quản lý theo Folder)</h2>
+  <h2>⚙️ Multi-Provider (Quản lý theo Website)</h2>
   
-  <div class="card">
-    <h3>Backup & Đồng bộ</h3>
-    <div class="row">
-      <div class="col-6">
-        <h4>Tải Backup</h4>
-        <p>Tải xuống toàn bộ cấu hình keys (bảng keymaps) dưới dạng file JSON.</p>
-        <a href="{{ url_for('admin_backup_download') }}?admin_secret={{ asec }}" class="btn green">Tải xuống Backup (.json)</a>
-      </div>
-      <div class="col-6" style="border-left: 1px solid var(--bd); padding-left: 12px;">
-        <h4>Upload (Restore)</h4>
-        <p><strong>CẢNH BÁO:</strong> Thao tác này sẽ <strong style="color:red">XÓA SẠCH</strong> toàn bộ keys hiện tại và thay thế bằng dữ liệu từ file backup.</p>
-        <form method="post" action="{{ url_for('admin_backup_upload') }}?admin_secret={{ asec }}" enctype="multipart/form-data" onsubmit="return confirm('Bạn có chắc chắn muốn XÓA SẠCH keys hiện tại và restore từ file?');">
-          <input type="file" name="backup_file" accept=".json" required>
-          <button type="submit" class="btn red">Upload và Restore</button>
-        </form>
-      </div>
-    </div>
-  </div>
   <div class="card" id="add-key-form-card">
     <h3>Thêm/Update Key</h3>
     <form method="post" action="{{ url_for('admin_add_keymap') }}?admin_secret={{ asec }}" id="main-key-form">
       <div class="row" style="margin-bottom:12px">
-        <div class="col-3">
-          <label>Folder / Người dùng</label>
-          <input class="mono" name="group_name" placeholder="vd: user_linh" required>
-        </div>
-        <div class="col-3">
+        <div class="col-4">
           <label>Provider Type</label>
-          <input class="mono" name="provider_type" value="mail72h" required>
+          <input class="mono" name="provider_type" placeholder="vd: mail72h" required>
         </div>
-        <div class="col-6">
+        
+        <div class="col-8">
           <label>Base URL (Web đấu API)</label>
-          <input class="mono" name="base_url" placeholder="https://mail72h.com">
+          <input class="mono" name="base_url" placeholder="https://mail72h.com" required>
         </div>
       </div>
       <div class="row">
@@ -293,14 +354,14 @@ details details summary { background: #f3f4f6; }
   </div>
 
   <div class="card">
-    <h3>Danh sách Keys (Theo Folder)</h3>
+    <h3>Danh sách Keys (Theo Website)</h3>
     {% if not grouped_data %}
       <p>Chưa có key nào. Vui lòng thêm key bằng form bên trên.</p>
     {% endif %}
     
     {% for folder, providers in grouped_data.items() %}
       <details class="folder">
-        <summary>📁 Folder: {{ folder }}</summary>
+        <summary>📁 Website: {{ folder }}</summary>
         <div class="content">
           {% for provider, data in providers.items() %}
             <details class="provider">
@@ -311,6 +372,7 @@ details details summary { background: #f3f4f6; }
                     <tr>
                       <th>SKU</th>
                       <th>input_key</th>
+                      <th>Base URL</th>
                       <th>product_id</th>
                       <th>Active</th>
                       <th>Hành động</th>
@@ -321,6 +383,7 @@ details details summary { background: #f3f4f6; }
                     <tr>
                       <td>{{ key['sku'] }}</td>
                       <td><code>{{ key['input_key'] }}</code></td>
+                      <td><code>{{ key['base_url'] }}</code></td>
                       <td>{{ key['product_id'] }}</td>
                       <td>{{ '✅' if key['is_active'] else '❌' }}</td>
                       <td>
@@ -336,7 +399,6 @@ details details summary { background: #f3f4f6; }
                   </tbody>
                 </table>
                 <button class="btn green small add-key-helper" 
-                        data-folder="{{ folder }}" 
                         data-provider="{{ provider }}" 
                         data-baseurl="{{ data['base_url'] }}"
                         data-apikey="{{ data.key_list[0]['api_key'] if data.key_list else '' }}">
@@ -350,21 +412,41 @@ details details summary { background: #f3f4f6; }
     {% endfor %}
   </div>
 
+  <div class="card">
+    <h3>Backup & Đồng bộ</h3>
+    <div class="row">
+      <div class="col-6">
+        <h4>Tải Backup</h4>
+        <p>Tải xuống toàn bộ cấu hình keys (bảng keymaps) dưới dạng file JSON.</p>
+        <a href="{{ url_for('admin_backup_download') }}?admin_secret={{ asec }}" class="btn green">Tải xuống Backup (.json)</a>
+      </div>
+      <div class="col-6" style="border-left: 1px solid var(--border); padding-left: 20px;">
+        <h4>Upload (Restore)</h4>
+        <p><strong>CẢNH BÁO:</strong> Thao tác này sẽ <strong style="color:var(--red)">XÓA SẠCH</strong> toàn bộ keys hiện tại và thay thế bằng dữ liệu từ file backup.</p>
+        <form method="post" action="{{ url_for('admin_backup_upload') }}?admin_secret={{ asec }}" enctype="multipart/form-data" onsubmit="return confirm('Bạn có chắc chắn muốn XÓA SẠCH keys hiện tại và restore từ file?');">
+          <input type="file" name="backup_file" accept=".json" required>
+          <button type="submit" class="btn red" style="margin-top: 8px;">Upload và Restore</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
 <script>
-function setLockedFields(isLocked, folder = '', provider = '', baseurl = '', apikey = '') {
+// === MỚI: CẬP NHẬT JS ĐỂ XÓA LOGIC 'FOLDER' ===
+function setLockedFields(isLocked, provider = '', baseurl = '', apikey = '') {
     const form = document.getElementById('main-key-form');
-    const folderInput = form.querySelector('input[name="group_name"]');
+    // const folderInput = form.querySelector('input[name="group_name"]'); // Đã xóa
     const providerInput = form.querySelector('input[name="provider_type"]');
     const baseurlInput = form.querySelector('input[name="base_url"]');
     const apikeyInput = form.querySelector('input[name="api_key"]');
 
-    folderInput.readOnly = isLocked;
+    // folderInput.readOnly = isLocked; // Đã xóa
     providerInput.readOnly = isLocked;
     baseurlInput.readOnly = isLocked;
     apikeyInput.readOnly = isLocked;
 
     if (isLocked) {
-        folderInput.value = folder;
+        // folderInput.value = folder; // Đã xóa
         providerInput.value = provider;
         baseurlInput.value = baseurl;
         apikeyInput.value = apikey;
@@ -374,12 +456,12 @@ function setLockedFields(isLocked, folder = '', provider = '', baseurl = '', api
 document.addEventListener('click', function(e) {
   if (e.target.classList.contains('add-key-helper')) {
     e.preventDefault();
-    const folder = e.target.dataset.folder;
+    // const folder = e.target.dataset.folder; // Đã xóa
     const provider = e.target.dataset.provider;
     const baseurl = e.target.dataset.baseurl;
     const apikey = e.target.dataset.apikey; 
     
-    setLockedFields(true, folder, provider, baseurl, apikey);
+    setLockedFields(true, provider, baseurl, apikey); // Đã xóa 'folder'
     
     const formCard = document.getElementById('add-key-form-card');
     formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -429,20 +511,26 @@ def admin_add_keymap():
     require_admin()
     f = request.form
     
-    group_name = f.get("group_name","").strip() or 'DEFAULT'
+    # === MỚI: ĐÃ XÓA 'group_name' khỏi form ===
+    # group_name = f.get("group_name","").strip() or 'DEFAULT'
     sku = f.get("sku","").strip()
     input_key = f.get("input_key","").strip()
     product_id = f.get("product_id","").strip()
     
-    provider_type = f.get("provider_type","").strip().lower() or 'mail72h'
+    provider_type = f.get("provider_type","").strip().lower() # Bỏ mặc định 'mail72h'
     base_url = f.get("base_url","").strip()
     api_key = f.get("api_key","").strip()
     
-    if not sku or not input_key or not product_id.isdigit() or not api_key:
-        return "Thiếu thông tin quan trọng (sku, input_key, product_id, api_key)", 400
+    # === MỚI: LẤY 'group_name' TỪ 'base_url' ===
+    group_name = base_url
     
-    if not base_url and provider_type == 'mail72h':
-        base_url = 'https://mail72h.com'
+    # === MỚI: CẬP NHẬT VALIDATION ===
+    if not sku or not input_key or not product_id.isdigit() or not api_key or not provider_type or not base_url:
+        return "Thiếu thông tin quan trọng (sku, input_key, product_id, api_key, provider_type, base_url)", 400
+    
+    # === MỚI: ĐÃ XÓA LOGIC MẶC ĐỊNH CỦA BASE_URL (vì giờ là 'required') ===
+    # if not base_url and provider_type == 'mail72h':
+    #     base_url = 'https://mail72h.com'
     
     with db() as con:
         con.execute("""
@@ -480,7 +568,7 @@ def admin_delete_key(kmid):
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
 # ==========================================================
-# === MỚI: Thêm 2 route cho Backup và Restore ===
+# === 2 route cho Backup và Restore ===
 # ==========================================================
 @app.route("/admin/backup/download")
 def admin_backup_download():
@@ -563,7 +651,7 @@ def admin_backup_upload():
         return "Loại file không hợp lệ. Vui lòng upload file .json.", 400
 # ==========================================================
 # === KẾT THÚC KHỐI ROUTE MỚI ===
-# ==========================================================
+# =================================G=========
 
 
 # ========= Public endpoints (Bộ định tuyến) =========
