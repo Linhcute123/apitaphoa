@@ -357,7 +357,10 @@ ADMIN_TPL = """
     }
     details summary:hover { filter: brightness(0.98); }
     details[open] summary { border-bottom: 1px solid var(--border); background-color: var(--card-bg);}
-    details .content { padding: 16px; background: var(--bg-light); }
+    
+    /* === THAY ĐỔI: Thêm overflow-x: auto cho content === */
+    details .content { padding: 16px; background: var(--bg-light); overflow-x: auto; }
+    
     details .content .btn { margin-top: 10px; }
     details details { margin-top: 10px; }
     details details summary { background: var(--nested-summary-bg); border-radius: 8px 8px 0 0; }
@@ -440,13 +443,15 @@ ADMIN_TPL = """
                   <tbody>
                   {% for key in data.key_list %}
                     <tr>
-                      <td style="white-space: nowrap; max-width: 250px; overflow: hidden; text-overflow: ellipsis;" title="{{ key['sku'] }}">
+                      <td style="white-space: normal; max-width: 300px; word-break: break-all;" title="{{ key['sku'] }}">
                         {{ key['sku'] }}
                       </td>
-                      <td style="white-space: nowrap; max-width: 150px; overflow: hidden; text-overflow: ellipsis;" title="{{ key['input_key'] }}">
+                      
+                      <td style="white-space: nowrap;" title="{{ key['input_key'] }}">
                         <code>{{ key['input_key'] }}</code>
                       </td>
-                      <td style="white-space: nowrap; max-width: 180px; overflow: hidden; text-overflow: ellipsis;" title="{{ key['base_url'] }}">
+                      
+                      <td style="white-space: nowrap;" title="{{ key['base_url'] }}">
                         <code>{{ key['base_url'] }}</code>
                       </td>
                       
