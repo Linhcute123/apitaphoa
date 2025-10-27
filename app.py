@@ -307,8 +307,8 @@ ADMIN_TPL = """
         color: var(--disabled-text); 
         cursor: not-allowed; 
     }
-    table{width:100%;border-collapse:collapse;margin-top: 10px;}
-    th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;word-break:break-all;vertical-align: middle;}
+    table{width:100%;border-collapse:collapse;margin-top: 10px; table-layout: fixed;} /* Added table-layout: fixed */
+    th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;word-break:break-word;vertical-align: middle;} /* Changed word-break */
     th { font-size: 12px; text-transform: uppercase; color: var(--text-light); }
     code{background:var(--code-bg); color: var(--primary); padding:3px 6px;border-radius:6px;font-family:monospace;font-size: 0.9em;}
     
@@ -440,10 +440,10 @@ ADMIN_TPL = """
                   <tbody>
                   {% for key in data.key_list %}
                     <tr>
-                      <td>{{ key['sku'] }}</td>
-                      <td><code>{{ key['input_key'] }}</code></td>
-                      <td><code>{{ key['base_url'] }}</code></td>
-                      <td>{{ key['product_id'] }}</td>
+                      <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ key['sku'] }}</td>
+                      <td style="max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"><code>{{ key['input_key'] }}</code></td>
+                      <td style="white-space: nowrap;"><code>{{ key['base_url'] }}</code></td>
+                      <td style="white-space: nowrap; min-width: 60px;">{{ key['product_id'] }}</td> 
                       <td>{{ '✅' if key['is_active'] else '❌' }}</td>
                       <td style="min-width: 210px;"> 
                         <div style="display: flex; gap: 4px; align-items: center; flex-wrap: nowrap;">
@@ -465,7 +465,7 @@ ADMIN_TPL = """
                               <button class="btn red small" type="submit">Xoá</button>
                             </form>
                         </div>
-                        </td>
+                      </td>
                     </tr>
                   {% endfor %}
                   </tbody>
