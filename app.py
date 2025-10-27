@@ -1,13 +1,11 @@
-import os, json, sqlite3
-from contextlib import closing
-# Import 'request' để đọc cookies
+import os, json, sqlite3, re, traceback
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
-import datetime 
 
-DB = os.getenv("DB_PATH", "store.db")
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
-DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "3"))
+DB = os.getenv("DB_PATH", "store_profiles.db")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "adminlinhdz")
+REQ_TIMEOUT = int(os.getenv("REQ_TIMEOUT", "4"))
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "0") in ("1","true","True","yes","YES")
 
 app = Flask(__name__)
 
@@ -25,902 +23,474 @@ def _ensure_col(con, table, col, decl):
 def init_db():
     with db() as con:
         con.execute("""
+        CREATE TABLE IF NOT EXISTS sites(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            base_url TEXT NOT NULL,
+            api_key TEXT,
+            detail_path TEXT,
+            list_path TEXT,
+            buy_path TEXT,
+            key_param TEXT,
+            stock_field TEXT
+        )""")
+        con.execute("""
         CREATE TABLE IF NOT EXISTS keymaps(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            site_id INTEGER NOT NULL,
             sku TEXT NOT NULL,
-            input_key TEXT NOT NULL UNIQUE,
+            input_key TEXT NOT NULL,
             product_id INTEGER NOT NULL,
             is_active INTEGER DEFAULT 1,
-            group_name TEXT,
-            provider_type TEXT NOT NULL DEFAULT 'mail72h',
-            base_url TEXT
+            UNIQUE(input_key, site_id),
+            FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
         )""")
-        _ensure_col(con, "keymaps", "group_name", "TEXT")
-        _ensure_col(con, "keymaps", "provider_type", "TEXT NOT NULL DEFAULT 'mail72h'")
-        _ensure_col(con, "keymaps", "base_url", "TEXT")
-        try:
-            con.execute("ALTER TABLE keymaps RENAME COLUMN provider_api_key TO api_key")
-        except: pass
-        try:
-            con.execute("ALTER TABLE keymaps RENAME COLUMN mail72h_api_key TO api_key")
-        except: pass
-        _ensure_col(con, "keymaps", "api_key", "TEXT")
-        try:
-            con.execute("ALTER TABLE keymaps DROP COLUMN note")
-        except:
-            pass 
+        _ensure_col(con,"sites","api_key","TEXT")
+        _ensure_col(con,"sites","detail_path","TEXT")
+        _ensure_col(con,"sites","list_path","TEXT")
+        _ensure_col(con,"sites","buy_path","TEXT")
+        _ensure_col(con,"sites","key_param","TEXT")
+        _ensure_col(con,"sites","stock_field","TEXT")
+        con.execute("""UPDATE sites SET
+            detail_path = COALESCE(detail_path, '/api/product.php'),
+            list_path   = COALESCE(list_path,   '/api/products.php'),
+            buy_path    = COALESCE(buy_path,    '/api/buy_product')
+        """)
         con.commit()
-
 init_db()
 
-# ==========================================================
-# === SỬA LỖI 6: Thu thập TẤT CẢ sản phẩm từ TẤT CẢ danh mục ===
-# ==========================================================
-def _collect_all_products(obj):
-    """
-    Thu thập TẤT CẢ các sản phẩm từ TẤT CẢ các danh mục.
-    Cấu trúc API là: {'categories': [{'products': [...]}, ...]}
-    """
-    all_products = []
-    if not isinstance(obj, dict):
-        print(f"DEBUG: API response is not a dict: {str(obj)[:200]}")
-        return None
+DEFAULT_KEY_NAMES = ("key","api_key","api_keyy")
 
-    categories = obj.get('categories')
-    if not isinstance(categories, list):
-        print(f"DEBUG: 'categories' key not found or is not a list in API response.")
-        return None # Không tìm thấy list 'categories'
+def _join_url(base, path):
+    base = base.rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
 
-    for category in categories:
-        if isinstance(category, dict):
-            products_in_category = category.get('products')
-            if isinstance(products_in_category, list):
-                all_products.extend(products_in_category) # Thêm tất cả sản phẩm vào list chung
-    
-    if not all_products: # Nếu không tìm thấy gì
-        print(f"DEBUG: Found 'categories' list, but no 'products' lists were found inside them.")
-        return None
-        
-    return all_products
-# ==========================================================
-# === KẾT THÚC SỬA LỖI ===
-# ==========================================================
-
-
-# ========= Helpers cho Provider 'mail72h' =========
-
-def mail72h_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
-    data = {"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}
-    url = f"{base_url.rstrip('/')}/api/buy_product"
-    r = requests.post(url, data=data, timeout=DEFAULT_TIMEOUT)
+def _http_get_json(url, params):
+    r = requests.get(url, params=params, timeout=REQ_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def mail72h_product_list(base_url: str, api_key: str) -> dict:
-    params = {"api_key": api_key}
-    url = f"{base_url.rstrip('/')}/api/products.php"
-    r = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+def _http_post_json(url, data):
+    r = requests.post(url, data=data, timeout=REQ_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
+def _extract_int(value):
+    if isinstance(value,(int,float)): return int(value)
+    if value is None: return None
+    m = re.search(r'[-+]?\\d[\\d,\\.]*', str(value))
+    if not m: return None
+    num = m.group(0).replace('.','').replace(',','')
+    try: return int(num)
+    except: return None
 
-def stock_mail72h(row):
-    try:
-        base_url = row['base_url'] or 'https://mail72h.com'
-        # Đây là ID từ CSDL của bạn (ví dụ: "28")
-        pid_to_find_str = str(row["product_id"])
-        
-        list_data = mail72h_product_list(base_url, row["api_key"])
-        
-        if list_data.get("status") != "success":
-            print(f"STOCK_ERROR (API List): {list_data.get('message', 'unknown')}")
-            return jsonify({"sum": 0}), 200
+def _deep_find_stock(obj):
+    keys = {'stock','tonkho','available','remain','left','quantity','qty','soluong','so_luong'}
+    if isinstance(obj, dict):
+        for k,v in obj.items():
+            if k.lower() in keys:
+                n = _extract_int(v)
+                if n is not None: return n
+            n = _deep_find_stock(v)
+            if n is not None: return n
+    elif isinstance(obj, list):
+        for it in obj:
+            n = _deep_find_stock(it)
+            if n is not None: return n
+    return None
 
-        # SỬA LỖI 6: Dùng hàm _collect_all_products
-        products = _collect_all_products(list_data)
+def _walk_field(obj, dotted):
+    cur = obj
+    for p in dotted.split("."):
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return None
+    return cur
 
-        if not products:
-             # Ghi log chi tiết hơn
-             print(f"STOCK_ERROR: Could not find 'categories' or 'products' list inside /products.php response. Raw data: {str(list_data)[:500]}")
-             return jsonify({"sum": 0}), 200
+def _choose_keynames(preferred):
+    if preferred and preferred.strip():
+        return (preferred.strip(),)
+    return DEFAULT_KEY_NAMES
 
-        stock_val = 0
-        found = False
-        for item in products:
-            if not isinstance(item, dict):
-                continue
-            
-            item_id_raw = item.get("id")
-            if item_id_raw is None:
-                continue
-            
-            # === SỬA LỖI 3: XỬ LÝ ID LÀ SỐ THỰC (FLOAT) "28.0" ===
-            try:
-                item_id_str_cleaned = str(int(float(str(item_id_raw).strip())))
-            except (ValueError, TypeError):
-                print(f"STOCK_DEBUG: Skipping unparseable product ID: {item_id_raw}")
-                continue
-            
-            if item_id_str_cleaned == pid_to_find_str:
-                
-                # ==========================================================
-                # === SỬA LỖI 6: Đọc 'amount' thay vì 'stock' ===
-                # ==========================================================
-                stock_from_api = item.get("amount") 
-                if not stock_from_api: # Xử lý None, "", 0
-                    stock_from_api = 0
-                
-                stock_val = int(str(stock_from_api).replace(".", ""))
-                # ==========================================================
-                
-                found = True
-                break
-        
-        if not found:
-            print(f"STOCK_ERROR: Product ID {pid_to_find_str} not found in *any* category. (Collected {len(products)} products, but ID mismatch. Check your admin config.)")
-            return jsonify({"sum": 0}), 200 
-        
-        return jsonify({"sum": stock_val})
-
-    except requests.HTTPError as e:
-        err_msg = f"mail72h http error {e.response.status_code}"
+def provider_product_detail(site, pid):
+    url = _join_url(site["base_url"], site["detail_path"] or "/api/product.php")
+    for k in _choose_keynames(site["key_param"]):
         try:
-            err_detail = e.response.json().get('message', e.response.text)
-            err_msg = f"mail72h error: {err_detail}"
-        except:
-            err_msg = f"mail72h http error {e.response.status_code}: {e.response.text}"
-        print(f"STOCK_ERROR (HTTP): {err_msg}")
-        return jsonify({"sum": 0}), 200
-    
-    except Exception as e:
-        print(f"STOCK_ERROR (Processing/Other): {e}")
-        return jsonify({"sum": 0}), 200
+            return _http_get_json(url, {k: site["api_key"], "id": pid})
+        except Exception:
+            continue
+    raise Exception("detail_refused")
 
-def fetch_mail72h(row, qty):
-    try:
-        base_url = row['base_url'] or 'https://mail72h.com'
-        res = mail72h_buy(base_url, row["api_key"], int(row["product_id"]), qty)
-    
-    except requests.HTTPError as e:
-        err_msg = f"mail72h http error {e.response.status_code}"
+def provider_products_list(site):
+    url = _join_url(site["base_url"], site["list_path"] or "/api/products.php")
+    for k in _choose_keynames(site["key_param"]):
         try:
-            err_detail = e.response.json().get('message', e.response.text)
-            err_msg = f"mail72h error: {err_detail}"
-        except:
-            err_msg = f"mail72h http error {e.response.status_code}: {e.response.text}"
-        print(f"FETCH_ERROR (HTTP): {err_msg}")
-        return jsonify([]), 200
+            return _http_get_json(url, {k: site["api_key"]})
+        except Exception:
+            continue
+    raise Exception("list_refused")
 
-    except Exception as e:
-        print(f"FETCH_ERROR (Connect): {e}")
-        return jsonify([]), 200
+def provider_buy(site, pid, amount):
+    url = _join_url(site["base_url"], site["buy_path"] or "/api/buy_product")
+    for k in _choose_keynames(site["key_param"]):
+        try:
+            return _http_post_json(url, {"action":"buyProduct","id":pid,"amount":amount,k:site["api_key"]})
+        except Exception:
+            continue
+    raise Exception("buy_refused")
 
-    if res.get("status") != "success":
-        print(f"FETCH_ERROR (API): {res.get('message', 'mail72h buy failed')}")
-        return jsonify([]), 200
+def provider_resolve_stock(site, pid):
+    try:
+        d = provider_product_detail(site, pid)
+        n = _extract_int(_walk_field(d, site["stock_field"])) if site["stock_field"] else _deep_find_stock(d)
+        if isinstance(n,int): return max(0,n)
+    except Exception:
+        pass
+    try:
+        lst = provider_products_list(site)
+        items = []
+        if isinstance(lst, dict):
+            for k in ("products","data","items","result"):
+                v = lst.get(k)
+                if isinstance(v, list): items=v; break
+        elif isinstance(lst, list):
+            items = lst
+        for it in items:
+            if not isinstance(it, dict): continue
+            pid2 = it.get("id", it.get("product_id"))
+            if str(pid2)==str(pid):
+                n = _extract_int(_walk_field(it, site["stock_field"])) if site["stock_field"] else _deep_find_stock(it)
+                if isinstance(n,int): return max(0,n)
+    except Exception:
+        pass
+    raise Exception("stock_not_found")
 
-    data = res.get("data")
-    out = []
-    if isinstance(data, list):
-        for it in data:
-            out.append({"product": (json.dumps(it, ensure_ascii=False) if isinstance(it, dict) else str(it))})
-    else:
-        t = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
-        out = [{"product": t} for _ in range(qty)]
-    
-    return jsonify(out)
-
-
-# ========= Admin UI (Folder lồng nhau) =========
-ADMIN_TPL = """
+# -------- Admin UI --------
+TPL = """
 <!doctype html>
-<html data-theme="light">
+<html>
 <head>
-    <meta charset="utf-8" />
-    <title>Multi-Provider (Per-Key API)</title>
-    <style>
-    /* === MỚI: Định nghĩa biến màu cho cả Sáng và Tối === */
-    :root { 
-        --primary: #0d6efd; 
-        --green: #198754; 
-        --red: #dc3545; 
-        --blue: #0d6efd;
-        --gray: #6c757d;
-        --shadow: 0 4px 12px rgba(0,0,0,0.05);
-        
-        /* Light Mode */
-        --bg-light: #f8f9fa; 
-        --border: #dee2e6;
-        --card-bg: #ffffff;
-        --text-dark: #212529;
-        --text-light: #495057;
-        --input-bg: #ffffff;
-        --disabled-bg: #e9ecef;
-        --disabled-text: #6c757d;
-        --code-bg: #e9ecef;
-        --nested-summary-bg: #f0f0f0;
-    }
-    /* === MỚI: Bảng màu Dark Mode === */
-    :root[data-theme="dark"] {
-        --primary: #3a86ff;
-        --green: #20c997;
-        --red: #f07167;
-        --blue: #3a86ff;
-        --gray: #adb5bd;
-        --shadow: 0 4px 12px rgba(0,0,0,0.2);
-
-        --bg-light: #121212;
-        --border: #343a40;
-        --card-bg: #1c1c1e;
-        --text-dark: #e9ecef;
-        --text-light: #adb5bd;
-        --input-bg: #2c2c2e;
-        --disabled-bg: #343a40;
-        --disabled-text: #6c757d;
-        --code-bg: #343a40;
-        --nested-summary-bg: #2c2c2e;
-    }
-
-    body{
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-        padding:28px;
-        /* === MỚI: Sử dụng biến CSS === */
-        color: var(--text-dark);
-        background: var(--bg-light);
-        line-height: 1.6;
-        transition: background-color 0.2s, color 0.2s;
-    }
-    .card{
-        border: 1px solid var(--border);
-        border-radius: 12px;
-        padding: 20px 24px;
-        margin-bottom: 24px;
-        /* === MỚI: Sử dụng biến CSS === */
-        background: var(--card-bg);
-        box-shadow: var(--shadow);
-        transition: background-color 0.2s, border-color 0.2s;
-    }
-    .row{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;align-items:end}
-    .col-1{grid-column:span 1}.col-2{grid-column:span 2}.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-6{grid-column:span 6}.col-8{grid-column:span 8}.col-12{grid-column:span 12}
-    label{
-        font-size: 13px;
-        font-weight: 600;
-        text-transform: uppercase;
-        color: var(--text-light);
-        margin-bottom: 4px;
-        display: block;
-    }
-    input, select {
-        width: 100%;
-        padding: 10px 14px;
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        box-sizing: border-box;
-        /* === MỚI: Sử dụng biến CSS === */
-        background: var(--input-bg);
-        color: var(--text-dark);
-        transition: border-color .2s, box-shadow .2s, background-color 0.2s, color 0.2s;
-    }
-    input:focus, select:focus {
-        border-color: var(--primary);
-        box-shadow: 0 0 0 3px rgba(13,110,253,0.25);
-        outline: none;
-    }
-    input:disabled, input[readonly] { 
-        background: var(--disabled-bg); 
-        color: var(--disabled-text); 
-        cursor: not-allowed; 
-    }
-    table{width:100%;border-collapse:collapse;margin-top: 10px;}
-    th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;word-break:break-all;vertical-align: middle;}
-    th { font-size: 12px; text-transform: uppercase; color: var(--text-light); }
-    /* === MỚI: Thêm màu cho code === */
-    code{background:var(--code-bg); color: var(--primary); padding:3px 6px;border-radius:6px;font-family:monospace;font-size: 0.9em;}
-    
-    button,.btn{
-        padding: 10px 16px;
-        border-radius: 8px;
-        border: 1px solid transparent;
-        background: var(--primary);
-        color: #fff;
-        cursor: pointer;
-        text-decoration: none;
-        font-weight: 600;
-        transition: background-color .2s, transform .1s;
-        display: inline-block;
-        text-align: center;
-        margin-bottom: 4px;
-    }
-    button:hover, .btn:hover {
-        filter: brightness(1.1);
-        transform: translateY(-1px);
-    }
-    .btn.red{background:var(--red);border-color:var(--red)}
-    .btn.blue{background:var(--blue);border-color:var(--blue)}
-    .btn.green{background:var(--green);border-color:var(--green)}
-    .btn.gray{background:var(--gray);border-color:var(--gray)}
-    .btn.small{padding: 6px 12px; font-size: 13px; font-weight: 500;}
-    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-    h2 {
-        font-size: 28px;
-        font-weight: 700;
-        color: var(--primary);
-        border-bottom: 2px solid var(--border);
-        padding-bottom: 10px;
-        margin-bottom: 20px;
-    }
-    h3 { margin-top: 0; margin-bottom: 16px; font-size: 22px; color: var(--text-dark); }
-    h4 { margin-top: 0; margin-bottom: 8px; font-size: 18px; color: var(--text-dark); }
-    details { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
-    details summary { 
-        padding: 14px 18px; 
-        cursor: pointer; 
-        font-weight: 600; 
-        background: var(--card-bg); 
-        transition: background-color 0.2s;
-        font-size: 1.1em;
-    }
-    details summary:hover { filter: brightness(0.98); }
-    details[open] summary { border-bottom: 1px solid var(--border); background-color: var(--card-bg);}
-    details .content { padding: 16px; background: var(--bg-light); }
-    details .content .btn { margin-top: 10px; }
-    details details { margin-top: 10px; }
-    details details summary { background: var(--nested-summary-bg); border-radius: 8px 8px 0 0; }
-    </style>
-    
-    <script>
-    (function() {
-        var mode = document.cookie.split('; ').find(row => row.startsWith('admin_mode='))?.split('=')[1] || 'light';
-        document.documentElement.setAttribute('data-theme', mode);
-    })();
-    </script>
+<meta charset="utf-8" />
+<title>Tạp Hóa – Multi Provider</title>
+<style>
+  :root { --bd:#e5e7eb; }
+  body { font-family: system-ui, Arial; padding:28px; color:#111 }
+  .card { border:1px solid var(--bd); border-radius:12px; padding:16px; margin-bottom:18px; }
+  .row { display:grid; grid-template-columns: repeat(12, 1fr); gap:12px; align-items:end; }
+  .col-2 { grid-column: span 2; } .col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; } .col-6 { grid-column: span 6; } .col-12 { grid-column: span 12; }
+  label { font-size:12px; text-transform:uppercase; color:#444; }
+  input { width:100%; padding:10px 12px; border:1px solid var(--bd); border-radius:10px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { padding:10px 12px; border-bottom:1px solid var(--bd); text-align:left; }
+  /* === MỚI: Thêm word-break: keep-all cho TD để ưu tiên không xuống dòng === */
+  td { word-break: keep-all; } 
+  code { background:#f3f4f6; padding:2px 6px; border-radius:6px; }
+  button, .btn { padding:10px 14px; border-radius:10px; border:1px solid #111; background:#111; color:#fff; cursor:pointer; text-decoration:none; }
+  .btn.red { background:#b91c1c; border-color:#991b1b; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>
 </head>
 <body>
-  <h2>⚙️ Multi-Provider (Quản lý theo Website)</h2>
-  
-  <div class="card" id="add-key-form-card">
-    <h3>Thêm/Update Key</h3>
-    <form method="post" action="{{ url_for('admin_add_keymap') }}?admin_secret={{ asec }}" id="main-key-form">
-      <div class="row" style="margin-bottom:12px">
-        <div class="col-4">
-          <label>Provider Type</label>
-          <input class="mono" name="provider_type" placeholder="vd: mail72h" required>
-        </div>
-        <div class="col-8">
-          <label>Base URL (Web đấu API)</label>
-          <input class="mono" name="base_url" placeholder="https://mail72h.com" required>
-        </div>
-      </div>
+  <h2>⚙️ Multi Provider – API key theo Site</h2>
+
+  <div class="card">
+    <h3>1) Thêm/Update Site</h3>
+    <form method="post" action="{{ url_for('admin_add_site') }}?admin_secret={{ asec }}">
       <div class="row">
-         <div class="col-2"><label>SKU</label><input class="mono" name="sku" placeholder="edu24h" required></div>
-         <div class="col-3"><label>input_key (Tạp Hóa)</label><input class="mono" name="input_key" placeholder="key-abc" required></div>
-         <div class="col-2"><label>product_id (của NCC)</label><input class="mono" name="product_id" type="number" placeholder="28" required></div>
-         <div class="col-3"><label>API key (của NCC)</label><input class="mono" name="api_key" type="password" required></div>
-         <div class="col-1"><button type="submit">Lưu key</button></div>
-         <div class="col-1"><button type="reset" class="btn gray" id="reset-form-btn">Xóa form</button></div>
+        <div class="col-3"><label>Site code</label><input class="mono" name="code" placeholder="mail72h" required></div>
+        <div class="col-6"><label>Base URL</label><input class="mono" name="base_url" placeholder="https://mail72h.com" required></div>
+        <div class="col-3"><label>API key</label><input class="mono" name="api_key" type="password" required></div>
+        <div class="col-4"><label>Detail path</label><input class="mono" name="detail_path" value="/api/product.php"></div>
+        <div class="col-4"><label>List path</label><input class="mono" name="list_path" value="/api/products.php"></div>
+        <div class="col-4"><label>Buy path</label><input class="mono" name="buy_path" value="/api/buy_product"></div>
+        <div class="col-4"><label>Key param</label><input class="mono" name="key_param" placeholder="auto | key | api_key"></div>
+        <div class="col-4"><label>Stock field</label><input class="mono" name="stock_field" placeholder="vd: data.stock (để trống = auto)"></div>
+        <div class="col-2"><button>Lưu site</button></div>
       </div>
     </form>
   </div>
 
   <div class="card">
-    <h3>Danh sách Keys (Theo Website)</h3>
-    {% if not grouped_data %}
-      <p>Chưa có key nào. Vui lòng thêm key bằng form bên trên.</p>
-    {% endif %}
-    
-    {% for folder, providers in grouped_data.items() %}
-      <details class="folder">
-        <summary>📁 Website: {{ folder }}</summary>
-        <div class="content">
-          {% for provider, data in providers.items() %}
-            <details class="provider">
-              <summary>📦 Provider: {{ provider }} ({{ data.key_list|length }} keys)</summary>
-              <div class="content">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>SKU</th>
-                      <th>input_key</th>
-                      <th>Base URL</th>
-                      <th>product_id</th>
-                      <th>Active</th>
-                      <th>Hành động</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                  {% for key in data.key_list %}
-                    <tr>
-                      <td>{{ key['sku'] }}</td>
-                      <td><code>{{ key['input_key'] }}</code></td>
-                      <td><code>{{ key['base_url'] }}</code></td>
-                      <td>{{ key['product_id'] }}</td>
-                      <td>{{ '✅' if key['is_active'] else '❌' }}</td>
-                      <td>
-                        <button class="btn gray small edit-key-btn" 
-                                style="display:inline"
-                                data-sku="{{ key['sku'] }}"
-                                data-inputkey="{{ key['input_key'] }}"
-                                data-productid="{{ key['product_id'] }}"
-                                data-apikey="{{ key['api_key'] }}"
-                                data-provider="{{ key['provider_type'] }}"
-                                data-baseurl="{{ key['base_url'] }}">
-                          Sửa ✏️
-                        </button>
-
-                        <form method="post" action="{{ url_for('admin_toggle_key', kmid=key['id']) }}?admin_secret={{ asec }}" style="display:inline">
-                          <button class="btn blue small" type="submit">{{ 'Disable' if key['is_active'] else 'Enable' }}</button>
-                        </form>
-                        <form method="post" action="{{ url_for('admin_delete_key', kmid=key['id']) }}?admin_secret={{ asec }}" style="display:inline" onsubmit="return confirm('Xoá key {{key['input_key']}}?')">
-                          <button class="btn red small" type="submit">Xoá</button>
-                        </form>
-                      </td>
-                    </tr>
-                  {% endfor %}
-                  </tbody>
-                </table>
-                <button class="btn green small add-key-helper" 
-                        data-provider="{{ provider }}" 
-                        data-baseurl="{{ data['base_url'] }}"
-                        data-apikey="{{ data.key_list[0]['api_key'] if data.key_list else '' }}">
-                  + Thêm Key vào đây
-                </button>
-              </div>
-            </details>
-          {% endfor %}
-        </div>
-      </details>
-    {% endfor %}
+    <h3>2) Thêm/Update Key</h3>
+    <form method="post" action="{{ url_for('admin_add_key') }}?admin_secret={{ asec }}">
+      <div class="row">
+        <div class="col-3"><label>Site</label><input class="mono" name="site_code" placeholder="mail72h" required></div>
+        <div class="col-3"><label>SKU</label><input class="mono" name="sku" placeholder="edu24h" required></div>
+        <div class="col-3"><label>input_key</label><input class="mono" name="input_key" placeholder="key-abc" required></div>
+        <div class="col-3"><label>product_id</label><input class="mono" name="product_id" type="number" placeholder="28" required></div>
+        <div class="col-2"><button>Lưu key</button></div>
+      </div>
+    </form>
   </div>
 
-  <div class="card" style="padding: 16px;">
-    <div class="row" style="align-items: center;">
-      <div class="col-4">
-        <label for="mode-switcher">Chọn Nền</label>
-        <select id="mode-switcher" class="mono">
-          <option value="light" {% if mode == 'light' %}selected{% endif %}>Sáng (Mặc định) ☀️</option>
-          <option value="dark" {% if mode == 'dark' %}selected{% endif %}>Tối 🌙</option>
-        </select>
-      </div>
-      <div class="col-4">
-        <label for="effect-switcher">Chọn Hiệu Ứng</label>
-        <select id="effect-switcher" class="mono">
-          <option value="default" {% if effect == 'default' %}selected{% endif %}>Không có</option>
-          <option value="snow" {% if effect == 'snow' %}selected{% endif %}>Tuyết Rơi (Xanh) ❄️</option>
-        </select>
-      </div>
-    </div>
-  </div>
   <div class="card">
-    <h3>Backup & Đồng bộ</h3>
-    <div class="row">
-      <div class="col-6">
-        <h4>Tải Backup</h4>
-        <p>Tải xuống toàn bộ cấu hình keys (bảng keymaps) dưới dạng file JSON.</p>
-        <a href="{{ url_for('admin_backup_download') }}?admin_secret={{ asec }}" class="btn green">Tải xuống Backup (.json)</a>
-      </div>
-      <div class="col-6" style="border-left: 1px solid var(--border); padding-left: 20px;">
-        <h4>Upload (Restore)</h4>
-        <p><strong>CẢNH BÁO:</strong> Thao tác này sẽ <strong style="color:var(--red)">XÓA SẠCH</strong> toàn bộ keys hiện tại và thay thế bằng dữ liệu từ file backup.</p>
-        <form method="post" action="{{ url_for('admin_backup_upload') }}?admin_secret={{ asec }}" enctype="multipart/form-data" onsubmit="return confirm('Bạn có chắc chắn muốn XÓA SẠCH keys hiện tại và restore từ file?');">
-          <input type="file" name="backup_file" accept=".json" required>
-          <button type="submit" class="btn red" style="margin-top: 8px;">Upload và Restore</button>
-        </form>
-      </div>
-    </div>
+    <h3>Sites</h3>
+    <table>
+      <thead><tr><th>Code</th><th>Base</th><th>Key param</th><th>Detail</th><th>List</th><th>Buy</th><th>Stock field</th><th>Xoá</th></tr></thead>
+      <tbody>
+      {% for s in sites %}
+        <tr>
+          <td><code>{{ s['code'] }}</code></td>
+          <td class="mono">{{ s['base_url'] }}</td>
+          <td class="mono">{{ s['key_param'] or 'auto' }}</td>
+          <td class="mono">{{ s['detail_path'] }}</td>
+          <td class="mono">{{ s['list_path'] }}</td>
+          <td class="mono">{{ s['buy_path'] }}</td>
+          <td class="mono">{{ s['stock_field'] or '' }}</td>
+          <td><a class="btn red" href="{{ url_for('admin_delete_site') }}?admin_secret={{ asec }}&code={{ s['code'] }}" onclick="return confirm('Xoá site {{ s['code'] }}?')">Xoá</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
   </div>
 
-<script>
-function setLockedFields(isLocked, provider = '', baseurl = '', apikey = '') {
-    const form = document.getElementById('main-key-form');
-    const providerInput = form.querySelector('input[name="provider_type"]');
-    const baseurlInput = form.querySelector('input[name="base_url"]');
-    const apikeyInput = form.querySelector('input[name="api_key"]');
+  <div class="card">
+    <h3>Keys</h3>
+    <table>
+      <thead><tr><th>ID</th><th>Site</th><th>SKU</th><th>input_key</th><th>product_id</th><th>Active</th><th>Test</th><th>Xoá</th></tr></thead>
+      <tbody>
+      {% for m in maps %}
+        <tr>
+          <td>{{ m['id'] }}</td>
+          <td><code>{{ m['site_code'] }}</code></td>
+          <td style="white-space: nowrap;">{{ m['sku'] }}</td>
+          <td style="white-space: nowrap;"><code>{{ m['input_key'] }}</code></td>
+          <td style="white-space: nowrap;">{{ m['product_id'] }}</td> 
+          <td>{{ m['is_active'] }}</td>
+          <td style="white-space: nowrap; min-width: 200px;"> <div style="display: flex; gap: 4px; align-items: center; flex-wrap: nowrap;">
+                <a class="mono" href="{{ url_for('admin_test_stock') }}?admin_secret={{ asec }}&key={{ m['input_key'] }}" target="_blank">Test stock</a>
+                &nbsp;|&nbsp;
+                <a class="mono" href="{{ url_for('admin_test_fetch') }}?admin_secret={{ asec }}&key={{ m['input_key'] }}&quantity=1" target="_blank">Test fetch</a>
+             </div>
+          </td>
+          <td style="white-space: nowrap;"><a class="btn red" href="{{ url_for('admin_delete_key') }}?admin_secret={{ asec }}&id={{ m['id'] }}" onclick="return confirm('Xoá key {{ m['input_key'] }}?')">Xoá</a></td>
+          </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
 
-    providerInput.readOnly = isLocked;
-    baseurlInput.readOnly = isLocked;
-    apikeyInput.readOnly = isLocked;
+  <div class="card">
+    <h3>Endpoint cho Tạp Hóa</h3>
+    <pre class="mono">
+Tồn kho (đọc trực tiếp):
+  GET /stock?key=&lt;input_key&gt;
 
-    if (isLocked) {
-        providerInput.value = provider;
-        baseurlInput.value = baseurl;
-        apikeyInput.value = apikey;
-    }
-}
+Lấy hàng (mua trực tiếp):
+  GET /fetch?key=&lt;input_key&gt;&order_id={order_id}&quantity={quantity}
+    </pre>
+  </div>
 
-document.addEventListener('click', function(e) {
-  // Logic cho nút "+ Thêm Key vào đây"
-  if (e.target.classList.contains('add-key-helper')) {
-    e.preventDefault();
-    const provider = e.target.dataset.provider;
-    const baseurl = e.target.dataset.baseurl;
-    const apikey = e.target.dataset.apikey; 
-    
-    setLockedFields(true, provider, baseurl, apikey); 
-    
-    const form = document.getElementById('main-key-form');
-    form.querySelector('input[name="sku"]').value = '';
-    form.querySelector('input[name="input_key"]').value = '';
-    form.querySelector('input[name="product_id"]').value = '';
-    
-    const formCard = document.getElementById('add-key-form-card');
-    formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    formCard.querySelector('input[name="sku"]').focus();
-  }
-
-  // Logic cho nút "Sửa ✏️"
-  if (e.target.classList.contains('edit-key-btn')) {
-    e.preventDefault();
-    setLockedFields(false);
-
-    const form = document.getElementById('main-key-form');
-    form.querySelector('input[name="provider_type"]').value = e.target.dataset.provider;
-    form.querySelector('input[name="base_url"]').value = e.target.dataset.baseurl;
-    form.querySelector('input[name="sku"]').value = e.target.dataset.sku;
-    form.querySelector('input[name="input_key"]').value = e.target.dataset.inputkey;
-    form.querySelector('input[name="product_id"]').value = e.target.dataset.productid;
-    form.querySelector('input[name="api_key"]').value = e.target.dataset.apikey;
-
-    const formCard = document.getElementById('add-key-form-card');
-    formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    formCard.querySelector('input[name="sku"]').focus();
-  }
-  
-});
-
-// Logic cho nút "Xóa form"
-document.getElementById('reset-form-btn').addEventListener('click', function() {
-    setLockedFields(false);
-});
-
-// ==========================================================
-// === MỚI: Cập nhật Logic cho 2 Switchers ===
-// ==========================================================
-
-// Logic cho Effect Switcher
-document.getElementById('effect-switcher').addEventListener('change', function() {
-    const selectedEffect = this.value;
-    // Đổi tên cookie
-    document.cookie = `admin_effect=${selectedEffect};path=/;max-age=31536000;SameSite=Lax`;
-    location.reload();
-});
-
-// Logic cho Mode Switcher (Sáng/Tối)
-document.getElementById('mode-switcher').addEventListener('change', function() {
-    const selectedMode = this.value;
-    // Lưu cookie
-    document.cookie = `admin_mode=${selectedMode};path=/;max-age=31536000;SameSite=Lax`;
-    // Áp dụng ngay lập tức
-    document.documentElement.setAttribute('data-theme', selectedMode);
-});
-</script>
-
-{% if effect == 'snow' %}
-<script id="snow-effect-script">
-(function() {
-    if (document.getElementById('snow-canvas')) return; 
-    var canvas = document.createElement('canvas');
-    canvas.id = 'snow-canvas';
-    canvas.style.position = 'fixed';
-    canvas.style.top = '0';
-    canvas.style.left = '0';
-    canvas.style.width = '100vw';
-    canvas.style.height = '100vh';
-    canvas.style.pointerEvents = 'none';
-    canvas.style.zIndex = '9999';
-    document.body.appendChild(canvas);
-
-    var ctx = canvas.getContext('2d');
-    var W = window.innerWidth;
-    var H = window.innerHeight;
-    canvas.width = W;
-    canvas.height = H;
-    var mp = 100; // max particles
-    var flakes = [];
-    for(var i = 0; i < mp; i++) {
-        flakes.push({
-            x: Math.random() * W, // x-coordinate
-            y: Math.random() * H, // y-coordinate
-            r: Math.random() * 4 + 1, // radius
-            d: Math.random() * mp // density
-        });
-    }
-    function draw() {
-        ctx.clearRect(0, 0, W, H);
-        /* === MỚI: Đổi màu tuyết thành XANH NHẠT === */
-        ctx.fillStyle = "rgba(173, 216, 230, 0.8)"; /* lightblue */
-        ctx.beginPath();
-        for(var i = 0; i < mp; i++) {
-            var f = flakes[i];
-            ctx.moveTo(f.x, f.y);
-            ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2, true);
-        }
-        ctx.fill();
-        update();
-    }
-    var angle = 0;
-    function update() {
-        angle += 0.01;
-        for(var i = 0; i < mp; i++) {
-            var f = flakes[i];
-            f.y += Math.cos(angle + f.d) + 1 + f.r / 2;
-            f.x += Math.sin(angle) * 2;
-            if(f.x > W + 5 || f.x < -5 || f.y > H) {
-                if(i % 3 > 0) { 
-                    flakes[i] = {x: Math.random() * W, y: -10, r: f.r, d: f.d};
-                } else {
-                    if(Math.sin(angle) > 0) {
-                        flakes[i] = {x: -5, y: Math.random() * H, r: f.r, d: f.d};
-                    } else {
-                        flakes[i] = {x: W + 5, y: Math.random() * H, r: f.r, d: f.d};
-                    }
-                }
-            }
-        }
-    }
-    var snowInterval = setInterval(draw, 33);
-    window.addEventListener('resize', function() {
-        W = window.innerWidth; H = window.innerHeight;
-        canvas.width = W; canvas.height = H;
-    });
-})();
-</script>
-{% endif %}
-
+  <div class="card">
+    <h3>Diag nhanh</h3>
+    <form method="get" action="{{ url_for('admin_diag') }}">
+      <input type="hidden" name="admin_secret" value="{{ asec }}"/>
+      <div class="row">
+        <div class="col-4"><label>input_key</label><input class="mono" name="key" placeholder="key-abc"></div>
+        <div class="col-2"><label>product_id</label><input class="mono" name="pid" placeholder="28"></div>
+        <div class="col-2"><button>Xem raw</button></div>
+      </div>
+    </form>
+  </div>
 </body>
 </html>
 """
-
-def find_map_by_key(key: str):
-    with db() as con:
-        row = con.execute("SELECT * FROM keymaps WHERE input_key=? AND is_active=1", (key,)).fetchone()
-        return row
 
 def require_admin():
     if request.args.get("admin_secret") != ADMIN_SECRET:
         abort(403)
 
+@app.errorhandler(Exception)
+def on_err(e):
+    if DEBUG_ERRORS:
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+    raise e
+
 @app.route("/admin")
 def admin_index():
     require_admin()
     with db() as con:
-        maps = con.execute("SELECT * FROM keymaps ORDER BY group_name, provider_type, sku, id").fetchall()
-    
-    grouped_data = {}
-    for key in maps:
-        folder = key['group_name'] or 'DEFAULT'
-        provider = key['provider_type']
-        
-        if folder not in grouped_data:
-            grouped_data[folder] = {}
-        
-        if provider not in grouped_data[folder]:
-            grouped_data[folder][provider] = {"key_list": [], "base_url": key['base_url']}
-        
-        grouped_data[folder][provider]["key_list"].append(key)
+        sites = con.execute("SELECT * FROM sites ORDER BY code").fetchall()
+        maps = con.execute("""
+            SELECT k.*, s.code AS site_code
+            FROM keymaps k JOIN sites s ON s.id = k.site_id
+            ORDER BY s.code, k.id
+        """).fetchall()
+    return render_template_string(TPL, sites=sites, maps=maps, asec=ADMIN_SECRET)
 
-    # === MỚI: Đọc 2 cookies riêng biệt ===
-    effect = request.cookies.get('admin_effect', 'default') # Cookie cho hiệu ứng
-    mode = request.cookies.get('admin_mode', 'light') # Cookie cho Sáng/Tối
-    
-    return render_template_string(ADMIN_TPL, grouped_data=grouped_data, asec=ADMIN_SECRET, effect=effect, mode=mode)
-
-@app.route("/admin/keymap", methods=["POST"])
-def admin_add_keymap():
+@app.route("/admin/site", methods=["POST"])
+def admin_add_site():
     require_admin()
     f = request.form
-    
+    code = f.get("code","").strip()
+    base_url = f.get("base_url","").strip()
+    api_key = f.get("api_key","").strip()
+    detail_path = f.get("detail_path","/api/product.php").strip() or "/api/product.php"
+    list_path   = f.get("list_path","/api/products.php").strip() or "/api/products.php"
+    buy_path    = f.get("buy_path","/api/buy_product").strip() or "/api/buy_product"
+    key_param   = f.get("key_param","").strip()
+    stock_field = f.get("stock_field","").strip()
+    if not code or not base_url or not api_key:
+        return "Missing code/base_url/api_key", 400
+    with db() as con:
+        con.execute("""
+        INSERT INTO sites(code, base_url, api_key, detail_path, list_path, buy_path, key_param, stock_field)
+        VALUES(?,?,?,?,?,?,?,?)
+        ON CONFLICT(code) DO UPDATE SET
+            base_url=excluded.base_url,
+            api_key=excluded.api_key,
+            detail_path=excluded.detail_path,
+            list_path=excluded.list_path,
+            buy_path=excluded.buy_path,
+            key_param=excluded.key_param,
+            stock_field=excluded.stock_field
+        """, (code, base_url, api_key, detail_path, list_path, buy_path, key_param, stock_field))
+        con.commit()
+    return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
+
+@app.route("/admin/key", methods=["POST"])
+def admin_add_key():
+    require_admin()
+    f = request.form
+    site_code = f.get("site_code","").strip()
     sku = f.get("sku","").strip()
     input_key = f.get("input_key","").strip()
     product_id = f.get("product_id","").strip()
-    
-    provider_type = f.get("provider_type","").strip().lower() 
-    base_url = f.get("base_url","").strip()
-    api_key = f.get("api_key","").strip()
-    
-    group_name = base_url
-    
-    if not sku or not input_key or not product_id.isdigit() or not api_key or not provider_type or not base_url:
-        return "Thiếu thông tin quan trọng (sku, input_key, product_id, api_key, provider_type, base_url)", 400
-    
+    if not all([site_code, sku, input_key, product_id]) or not product_id.isdigit():
+        return "Missing/invalid fields", 400
     with db() as con:
+        s = con.execute("SELECT id FROM sites WHERE code=?", (site_code,)).fetchone()
+        if not s:
+            return "Site not found", 400
         con.execute("""
-            INSERT INTO keymaps(group_name, sku, input_key, product_id, api_key, is_active, provider_type, base_url)
-            VALUES(?,?,?,?,?,1,?,?)
-            ON CONFLICT(input_key) DO UPDATE SET
-              group_name=excluded.group_name,
-              sku=excluded.sku,
-              product_id=excluded.product_id,
-              api_key=excluded.api_key,
-              is_active=1,
-              provider_type=excluded.provider_type,
-              base_url=excluded.base_url
-        """, (group_name, sku, input_key, int(product_id), api_key, provider_type, base_url))
+        INSERT INTO keymaps(site_id, sku, input_key, product_id, is_active)
+        VALUES(?,?,?,?,1)
+        ON CONFLICT(input_key, site_id) DO UPDATE SET
+            sku=excluded.sku,
+            product_id=excluded.product_id,
+            is_active=1
+        """, (s["id"], sku, input_key, int(product_id)))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-@app.route("/admin/keymap/<int:kmid>/toggle", methods=["POST"])
-def admin_toggle_key(kmid):
+@app.route("/admin/delete/site")
+def admin_delete_site():
     require_admin()
+    code = request.args.get("code","").strip()
+    if not code: return "missing code", 400
     with db() as con:
-        row = con.execute("SELECT is_active FROM keymaps WHERE id=?", (kmid,)).fetchone()
-        if not row: abort(404)
-        newv = 0 if row["is_active"] else 1
-        con.execute("UPDATE keymaps SET is_active=? WHERE id=?", (newv, kmid))
+        con.execute("DELETE FROM sites WHERE code=?", (code,))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-@app.route("/admin/keymap/<int:kmid>", methods=["POST"])
-def admin_delete_key(kmid):
+@app.route("/admin/delete/key")
+def admin_delete_key():
     require_admin()
+    kid = request.args.get("id","").strip()
+    if not kid or not kid.isdigit(): return "missing id", 400
     with db() as con:
-        con.execute("DELETE FROM keymaps WHERE id=?", (kmid,))
+        con.execute("DELETE FROM keymaps WHERE id=?", (int(kid),))
         con.commit()
     return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
 
-# ==========================================================
-# === 2 route cho Backup và Restore ===
-# ==========================================================
-@app.route("/admin/backup/download")
-def admin_backup_download():
+# ---- Diag raw ----
+@app.route("/admin/diag")
+def admin_diag():
     require_admin()
+    key = request.args.get("key","").strip()
+    pid = request.args.get("pid","").strip()
+    if not key or not pid:
+        return jsonify({"status":"error","msg":"missing key/pid"}), 400
+    km = _get_site_and_key(key)
+    if not km:
+        return jsonify({"status":"error","msg":"unknown key"}), 404
+    site = km
+    out = {}
+    # detail
     try:
-        with db() as con:
-            maps = con.execute("SELECT * FROM keymaps").fetchall()
-        
-        data_to_export = [dict(row) for row in maps]
-        
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"keymaps_backup_{timestamp}.json"
-        
-        response = jsonify(data_to_export)
-        response.headers['Content-Disposition'] = f'attachment; filename={filename}'
-        response.headers['Content-Type'] = 'application/json'
-        return response
-        
+        out["detail"] = provider_product_detail(site, int(pid))
     except Exception as e:
-        print(f"BACKUP_DOWNLOAD_ERROR: {e}")
-        return "Lỗi khi tạo file backup", 500
+        out["detail_error"] = str(e)
+    # list
+    try:
+        out["list"] = provider_products_list(site)
+    except Exception as e:
+        out["list_error"] = str(e)
+    return jsonify(out)
 
-@app.route("/admin/backup/upload", methods=["POST"])
-def admin_backup_upload():
+def _get_site_and_key(input_key):
+    with db() as con:
+        row = con.execute("""
+        SELECT k.*, s.code AS site_code, s.base_url, s.api_key, s.detail_path, s.list_path, s.buy_path, s.key_param, s.stock_field
+        FROM keymaps k JOIN sites s ON s.id = k.site_id
+        WHERE k.input_key=? AND k.is_active=1
+        """, (input_key,)).fetchone()
+    return row
+
+# ---- Admin tests ----
+@app.route("/admin/test/stock")
+def admin_test_stock():
     require_admin()
-    
-    if 'backup_file' not in request.files:
-        return "Không tìm thấy file trong request", 400
-    file = request.files['backup_file']
-    if file.filename == '':
-        return "Chưa chọn file", 400
-    
-    if file and file.filename.endswith('.json'):
-        try:
-            file_content = file.read().decode('utf-8')
-            data_to_import = json.loads(file_content)
-            
-            if not isinstance(data_to_import, list):
-                return "Lỗi định dạng JSON: Nội dung file không phải là một danh sách (list).", 400
-            
-            with db() as con:
-                con.execute("DELETE FROM keymaps")
-                
-                for item in data_to_import:
-                    con.execute("""
-                        INSERT INTO keymaps(
-                            id, sku, input_key, product_id, is_active, 
-                            group_name, provider_type, base_url, api_key
-                        ) 
-                        VALUES(?,?,?,?,?,?,?,?,?)
-                    """, (
-                        item.get('id'), 
-                        item.get('sku'),
-                        item.get('input_key'),
-                        item.get('product_id'),
-                        item.get('is_active', 1),
-                        item.get('group_name', 'DEFAULT'),
-                        item.get('provider_type', 'mail72h'),
-                        item.get('base_url'),
-                        item.get('api_key')
-                    ))
-                
-                con.commit()
-            
-            return redirect(url_for("admin_index", admin_secret=ADMIN_SECRET))
-            
-        except json.JSONDecodeError:
-            return "File JSON không hợp lệ. Vui lòng kiểm tra lại.", 400
-        except Exception as e:
-            print(f"BACKUP_UPLOAD_ERROR: {e}")
-            return f"Đã xảy ra lỗi trong quá trình restore: {e}", 500
-    else:
-        return "Loại file không hợp lệ. Vui lòng upload file .json.", 400
-# ==========================================================
-# === KẾT THÚC KHỐI ROUTE MỚI ===
-# ==========================================================
+    key = request.args.get("key","").strip()
+    if not key: return jsonify({"status":"error","msg":"missing key"}), 400
+    km = _get_site_and_key(key)
+    if not km: return jsonify({"status":"error","msg":"unknown key"}), 404
+    try:
+        s = provider_resolve_stock(km, int(km["product_id"]))
+        return jsonify({"parsed_stock": s})
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}), 502
 
+@app.route("/admin/test/fetch")
+def admin_test_fetch():
+    require_admin()
+    key = request.args.get("key","").strip()
+    qty = int(request.args.get("quantity","1") or "1")
+    km = _get_site_and_key(key)
+    if not km: return jsonify({"status":"error","msg":"unknown key"}), 404
+    try:
+        r = provider_buy(km, int(km["product_id"]), qty)
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}), 502
 
-# ========= Public endpoints (Bộ định tuyến) =========
+# ---- Public ----
 @app.route("/stock")
 def stock():
     key = request.args.get("key","").strip()
-    if not key:
-        print("STOCK_ERROR: Missing key")
-        return jsonify({"sum": 0}), 200
-        
-    row = find_map_by_key(key)
-    if not row:
-        print(f"STOCK_ERROR: Unknown key {key}")
-        return jsonify({"sum": 0}), 200
-
-    provider = row['provider_type']
-    
-    if provider == 'mail72h':
-        return stock_mail72h(row)
-    else:
-        print(f"STOCK_ERROR: Provider '{provider}' not supported")
-        return jsonify({"sum": 0}), 200
-
+    if not key: return jsonify({"status":"error","msg":"missing key"}), 400
+    km = _get_site_and_key(key)
+    if not km: return jsonify({"status":"error","msg":"unknown key"}), 404
+    try:
+        s = provider_resolve_stock(km, int(km["product_id"]))
+        return jsonify({"sum": int(s)})
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}), 502
 
 @app.route("/fetch")
 def fetch():
     key = request.args.get("key","").strip()
     qty_s = request.args.get("quantity","").strip()
-    
-    if not key or not qty_s:
-        print("FETCH_ERROR: Missing key/quantity")
-        return jsonify([]), 200
+    order_id = request.args.get("order_id","").strip()
+    if not key or not qty_s: return jsonify({"status":"error","msg":"missing key/quantity"}), 400
     try:
-        qty = int(qty_s); 
-        if qty<=0 or qty>1000: raise ValueError()
+        qty = int(qty_s)
+        if qty <= 0 or qty > 1000: raise ValueError()
     except Exception:
-        print(f"FETCH_ERROR: Invalid quantity '{qty_s}'")
-        return jsonify([]), 200
-
-    row = find_map_by_key(key)
-    if not row:
-        print(f"FETCH_ERROR: Unknown key {key}")
-        return jsonify([]), 200
-    
-    provider = row['provider_type']
-
-    if provider == 'mail72h':
-        return fetch_mail72h(row, qty)
-    else:
-        print(f"FETCH_ERROR: Provider '{provider}' not supported")
-        return jsonify([]), 200
+        return jsonify({"status":"error","msg":"invalid quantity"}), 400
+    km = _get_site_and_key(key)
+    if not km: return jsonify({"status":"error","msg":"unknown key"}), 404
+    try:
+        r = provider_buy(km, int(km["product_id"]), qty)
+        return jsonify(r)
+    except Exception as e:
+        return jsonify({"status":"error","msg":str(e)}), 502
 
 @app.route("/")
-def health():
-    return "OK", 200
-
-# ==========================================================
-# === ROUTE DEBUG: ĐỂ XEM DANH SÁCH SẢN PHẨM TỪ NCC ===
-# ==========================================================
-@app.route("/debuglist")
-def debug_list_products():
-    require_admin()
-    
-    key = request.args.get("key","").strip()
-    if not key:
-        return "Vui lòng cung cấp ?key=... (dùng key đang bị lỗi)", 400
-        
-    row = find_map_by_key(key)
-    if not row:
-        return f"Không tìm thấy key: {key}", 404
-    
-    if row['provider_type'] != 'mail72h':
-        return f"Key này không dùng provider 'mail72h'", 400
-        
-    try:
-        base_url = row['base_url'] or 'https://mail72h.com'
-        api_key = row["api_key"]
-        list_data = mail72h_product_list(base_url, api_key)
-        
-        return jsonify(list_data)
-        
-    except Exception as e:
-        return f"Lỗi khi gọi API nhà cung cấp: {e}", 500
-# ==========================================================
-
+def health(): return "OK", 200
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT","8000")))
