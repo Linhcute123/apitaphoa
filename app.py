@@ -107,7 +107,6 @@ def mail72h_product_list(base_url: str, api_key: str) -> dict:
 def stock_mail72h(row):
     try:
         base_url = row['base_url'] or 'https://mail72h.com'
-        # Đây là ID từ CSDL của bạn (ví dụ: "28")
         pid_to_find_str = str(row["product_id"])
         
         list_data = mail72h_product_list(base_url, row["api_key"])
@@ -116,25 +115,19 @@ def stock_mail72h(row):
             print(f"STOCK_ERROR (API List): {list_data.get('message', 'unknown')}")
             return jsonify({"sum": 0}), 200
 
-        # SỬA LỖI 6: Dùng hàm _collect_all_products
         products = _collect_all_products(list_data)
 
         if not products:
-             # Ghi log chi tiết hơn
              print(f"STOCK_ERROR: Could not find 'categories' or 'products' list inside /products.php response. Raw data: {str(list_data)[:500]}")
              return jsonify({"sum": 0}), 200
 
         stock_val = 0
         found = False
         for item in products:
-            if not isinstance(item, dict):
-                continue
-            
+            if not isinstance(item, dict): continue
             item_id_raw = item.get("id")
-            if item_id_raw is None:
-                continue
+            if item_id_raw is None: continue
             
-            # === SỬA LỖI 3: XỬ LÝ ID LÀ SỐ THỰC (FLOAT) "28.0" ===
             try:
                 item_id_str_cleaned = str(int(float(str(item_id_raw).strip())))
             except (ValueError, TypeError):
@@ -142,17 +135,9 @@ def stock_mail72h(row):
                 continue
             
             if item_id_str_cleaned == pid_to_find_str:
-                
-                # ==========================================================
-                # === SỬA LỖI 6: Đọc 'amount' thay vì 'stock' ===
-                # ==========================================================
                 stock_from_api = item.get("amount") 
-                if not stock_from_api: # Xử lý None, "", 0
-                    stock_from_api = 0
-                
+                if not stock_from_api: stock_from_api = 0
                 stock_val = int(str(stock_from_api).replace(".", ""))
-                # ==========================================================
-                
                 found = True
                 break
         
@@ -164,11 +149,8 @@ def stock_mail72h(row):
 
     except requests.HTTPError as e:
         err_msg = f"mail72h http error {e.response.status_code}"
-        try:
-            err_detail = e.response.json().get('message', e.response.text)
-            err_msg = f"mail72h error: {err_detail}"
-        except:
-            err_msg = f"mail72h http error {e.response.status_code}: {e.response.text}"
+        try: err_detail = e.response.json().get('message', e.response.text); err_msg = f"mail72h error: {err_detail}"
+        except: err_msg = f"mail72h http error {e.response.status_code}: {e.response.text}"
         print(f"STOCK_ERROR (HTTP): {err_msg}")
         return jsonify({"sum": 0}), 200
     
@@ -183,11 +165,8 @@ def fetch_mail72h(row, qty):
     
     except requests.HTTPError as e:
         err_msg = f"mail72h http error {e.response.status_code}"
-        try:
-            err_detail = e.response.json().get('message', e.response.text)
-            err_msg = f"mail72h error: {err_detail}"
-        except:
-            err_msg = f"mail72h http error {e.response.status_code}: {e.response.text}"
+        try: err_detail = e.response.json().get('message', e.response.text); err_msg = f"mail72h error: {err_detail}"
+        except: err_msg = f"mail72h http error {e.response.status_code}: {e.response.text}"
         print(f"FETCH_ERROR (HTTP): {err_msg}")
         return jsonify([]), 200
 
@@ -307,8 +286,9 @@ ADMIN_TPL = """
         color: var(--disabled-text); 
         cursor: not-allowed; 
     }
-    table{width:100%;border-collapse:collapse;margin-top: 10px; table-layout: fixed;} /* Added table-layout: fixed */
-    th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;word-break:break-word;vertical-align: middle;} /* Changed word-break */
+    /* === MỚI: Bỏ table-layout: fixed; === */
+    table{width:100%;border-collapse:collapse;margin-top: 10px;} 
+    th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;vertical-align: middle;} /* Bỏ word-break */
     th { font-size: 12px; text-transform: uppercase; color: var(--text-light); }
     code{background:var(--code-bg); color: var(--primary); padding:3px 6px;border-radius:6px;font-family:monospace;font-size: 0.9em;}
     
@@ -440,8 +420,8 @@ ADMIN_TPL = """
                   <tbody>
                   {% for key in data.key_list %}
                     <tr>
-                      <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ key['sku'] }}</td>
-                      <td style="max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"><code>{{ key['input_key'] }}</code></td>
+                      <td style="white-space: nowrap;">{{ key['sku'] }}</td>
+                      <td style="white-space: nowrap;"><code>{{ key['input_key'] }}</code></td>
                       <td style="white-space: nowrap;"><code>{{ key['base_url'] }}</code></td>
                       <td style="white-space: nowrap; min-width: 60px;">{{ key['product_id'] }}</td> 
                       <td>{{ '✅' if key['is_active'] else '❌' }}</td>
