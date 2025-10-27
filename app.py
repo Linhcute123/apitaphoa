@@ -1,8 +1,9 @@
 import os, json, sqlite3
 from contextlib import closing
+# === MỚI: Thêm 'request' để đọc cookies ===
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string
 import requests
-import datetime # Thêm import này
+import datetime 
 
 DB = os.getenv("DB_PATH", "store.db")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
@@ -253,7 +254,8 @@ label{
     margin-bottom: 4px;
     display: block;
 }
-input{
+/* === MỚI: Thêm 'select' vào rule này === */
+input, select {
     width: 100%;
     padding: 10px 14px;
     border: 1px solid var(--border);
@@ -261,7 +263,8 @@ input{
     box-sizing: border-box;
     transition: border-color .2s, box-shadow .2s;
 }
-input:focus {
+/* === MỚI: Thêm 'select' vào rule này === */
+input:focus, select:focus {
     border-color: var(--primary);
     box-shadow: 0 0 0 3px rgba(13,110,253,0.25);
     outline: none;
@@ -287,7 +290,7 @@ button,.btn{
     transition: background-color .2s, transform .1s;
     display: inline-block;
     text-align: center;
-    margin-bottom: 4px; /* === MỚI: Thêm margin để các nút không dính vào nhau === */
+    margin-bottom: 4px;
 }
 button:hover, .btn:hover {
     filter: brightness(1.1);
@@ -329,6 +332,17 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
 <body>
   <h2>⚙️ Multi-Provider (Quản lý theo Website)</h2>
   
+  <div class="card" style="padding: 16px;">
+    <div class="row" style="align-items: center;">
+      <div class="col-4">
+        <label for="theme-switcher">Chọn Giao Diện</label>
+        <select id="theme-switcher" class="mono">
+          <option value="default" {% if theme == 'default' %}selected{% endif %}>Mặc định</option>
+          <option value="snow" {% if theme == 'snow' %}selected{% endif %}>Hiệu ứng Tuyết Rơi ❄️</option>
+        </select>
+      </div>
+    </div>
+  </div>
   <div class="card" id="add-key-form-card">
     <h3>Thêm/Update Key</h3>
     <form method="post" action="{{ url_for('admin_add_keymap') }}?admin_secret={{ asec }}" id="main-key-form">
@@ -397,6 +411,7 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
                                 data-baseurl="{{ key['base_url'] }}">
                           Sửa ✏️
                         </button>
+
                         <form method="post" action="{{ url_for('admin_toggle_key', kmid=key['id']) }}?admin_secret={{ asec }}" style="display:inline">
                           <button class="btn blue small" type="submit">{{ 'Disable' if key['is_active'] else 'Enable' }}</button>
                         </form>
@@ -469,7 +484,6 @@ document.addEventListener('click', function(e) {
     
     setLockedFields(true, provider, baseurl, apikey); 
     
-    // Xóa các trường dữ liệu key cũ
     const form = document.getElementById('main-key-form');
     form.querySelector('input[name="sku"]').value = '';
     form.querySelector('input[name="input_key"]').value = '';
@@ -480,16 +494,11 @@ document.addEventListener('click', function(e) {
     formCard.querySelector('input[name="sku"]').focus();
   }
 
-  // ==========================================================
-  // === MỚI: Logic cho nút "Sửa ✏️" ===
-  // ==========================================================
+  // Logic cho nút "Sửa ✏️"
   if (e.target.classList.contains('edit-key-btn')) {
     e.preventDefault();
-    
-    // 1. Mở khóa tất cả các trường
     setLockedFields(false);
 
-    // 2. Điền dữ liệu từ key vào form
     const form = document.getElementById('main-key-form');
     form.querySelector('input[name="provider_type"]').value = e.target.dataset.provider;
     form.querySelector('input[name="base_url"]').value = e.target.dataset.baseurl;
@@ -498,22 +507,109 @@ document.addEventListener('click', function(e) {
     form.querySelector('input[name="product_id"]').value = e.target.dataset.productid;
     form.querySelector('input[name="api_key"]').value = e.target.dataset.apikey;
 
-    // 3. Cuộn lên form và focus
     const formCard = document.getElementById('add-key-form-card');
     formCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
     formCard.querySelector('input[name="sku"]').focus();
   }
-  // ==========================================================
   
 });
 
 // Logic cho nút "Xóa form"
 document.getElementById('reset-form-btn').addEventListener('click', function() {
-    // Mở khóa các trường khi reset
     setLockedFields(false);
-    // (Trình duyệt sẽ tự động xóa nội dung do type="reset")
+});
+
+// ==========================================================
+// === MỚI: Logic cho Theme Switcher ===
+// ==========================================================
+document.getElementById('theme-switcher').addEventListener('change', function() {
+    const selectedTheme = this.value;
+    // Lưu vào cookie, hết hạn sau 1 năm
+    document.cookie = `admin_theme=${selectedTheme};path=/;max-age=31536000;SameSite=Lax`;
+    // Tải lại trang để áp dụng
+    location.reload();
 });
 </script>
+
+{% if theme == 'snow' %}
+<script id="snow-effect-script">
+(function() {
+    if (document.getElementById('snow-canvas')) return; // Đã chạy rồi
+
+    var canvas = document.createElement('canvas');
+    canvas.id = 'snow-canvas';
+    canvas.style.position = 'fixed';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.width = '100vw';
+    canvas.style.height = '100vh';
+    canvas.style.pointerEvents = 'none';
+    canvas.style.zIndex = '9999';
+    document.body.appendChild(canvas);
+
+    var ctx = canvas.getContext('2d');
+    var flakes = [];
+    var W = window.innerWidth;
+    var H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    var mp = 100; // max particles
+
+    for(var i = 0; i < mp; i++) {
+        flakes.push({
+            x: Math.random() * W, // x-coordinate
+            y: Math.random() * H, // y-coordinate
+            r: Math.random() * 4 + 1, // radius
+            d: Math.random() * mp // density
+        });
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
+        ctx.beginPath();
+        for(var i = 0; i < mp; i++) {
+            var f = flakes[i];
+            ctx.moveTo(f.x, f.y);
+            ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2, true);
+        }
+        ctx.fill();
+        update();
+    }
+
+    var angle = 0;
+    function update() {
+        angle += 0.01;
+        for(var i = 0; i < mp; i++) {
+            var f = flakes[i];
+            f.y += Math.cos(angle + f.d) + 1 + f.r / 2;
+            f.x += Math.sin(angle) * 2;
+
+            if(f.x > W + 5 || f.x < -5 || f.y > H) {
+                if(i % 3 > 0) { 
+                    flakes[i] = {x: Math.random() * W, y: -10, r: f.r, d: f.d};
+                } else {
+                    if(Math.sin(angle) > 0) {
+                        flakes[i] = {x: -5, y: Math.random() * H, r: f.r, d: f.d};
+                    } else {
+                        flakes[i] = {x: W + 5, y: Math.random() * H, r: f.r, d: f.d};
+                    }
+                }
+            }
+        }
+    }
+    
+    var snowInterval = setInterval(draw, 33);
+
+    window.addEventListener('resize', function() {
+        W = window.innerWidth;
+        H = window.innerHeight;
+        canvas.width = W;
+        canvas.height = H;
+    });
+})();
+</script>
+{% endif %}
 </body></html>
 """
 
@@ -545,7 +641,9 @@ def admin_index():
         
         grouped_data[folder][provider]["key_list"].append(key)
 
-    return render_template_string(ADMIN_TPL, grouped_data=grouped_data, asec=ADMIN_SECRET)
+    # === MỚI: Đọc cookie theme và truyền vào template ===
+    theme = request.cookies.get('admin_theme', 'default')
+    return render_template_string(ADMIN_TPL, grouped_data=grouped_data, asec=ADMIN_SECRET, theme=theme)
 
 @app.route("/admin/keymap", methods=["POST"])
 def admin_add_keymap():
