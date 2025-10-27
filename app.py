@@ -214,118 +214,166 @@ def fetch_mail72h(row, qty):
 # ========= Admin UI (Folder lồng nhau) =========
 ADMIN_TPL = """
 <!doctype html>
-<html><head><meta charset="utf-8" />
-<title>Multi-Provider (Per-Key API)</title>
-<style>
-:root { 
-    --primary: #0d6efd; 
-    --green: #198754; 
-    --red: #dc3545; 
-    --blue: #0d6efd;
-    --gray: #6c757d;
-    --bg-light: #f8f9fa; 
-    --border: #dee2e6;
-    --shadow: 0 4px 12px rgba(0,0,0,0.05);
-    --text-dark: #212529;
-    --text-light: #495057;
-}
-body{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    padding:28px;
-    color: var(--text-dark);
-    background: var(--bg-light);
-    line-height: 1.6;
-}
-.card{
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 20px 24px;
-    margin-bottom: 24px;
-    background: #fff;
-    box-shadow: var(--shadow);
-}
-.row{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;align-items:end}
-.col-1{grid-column:span 1}.col-2{grid-column:span 2}.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-6{grid-column:span 6}.col-8{grid-column:span 8}.col-12{grid-column:span 12}
-label{
-    font-size: 13px;
-    font-weight: 600;
-    text-transform: uppercase;
-    color: var(--text-light);
-    margin-bottom: 4px;
-    display: block;
-}
-input, select {
-    width: 100%;
-    padding: 10px 14px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    box-sizing: border-box;
-    transition: border-color .2s, box-shadow .2s;
-}
-input:focus, select:focus {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px rgba(13,110,253,0.25);
-    outline: none;
-}
-input:disabled, input[readonly] { 
-    background: #e9ecef; 
-    color: #6c757d; 
-    cursor: not-allowed; 
-}
-table{width:100%;border-collapse:collapse;margin-top: 10px;}
-th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;word-break:break-all;vertical-align: middle;}
-th { font-size: 12px; text-transform: uppercase; color: var(--text-light); }
-code{background:#e9ecef;padding:3px 6px;border-radius:6px;font-family:monospace;font-size: 0.9em;}
-button,.btn{
-    padding: 10px 16px;
-    border-radius: 8px;
-    border: 1px solid transparent;
-    background: var(--primary);
-    color: #fff;
-    cursor: pointer;
-    text-decoration: none;
-    font-weight: 600;
-    transition: background-color .2s, transform .1s;
-    display: inline-block;
-    text-align: center;
-    margin-bottom: 4px;
-}
-button:hover, .btn:hover {
-    filter: brightness(1.1);
-    transform: translateY(-1px);
-}
-.btn.red{background:var(--red);border-color:var(--red)}
-.btn.blue{background:var(--blue);border-color:var(--blue)}
-.btn.green{background:var(--green);border-color:var(--green)}
-.btn.gray{background:var(--gray);border-color:var(--gray)}
-.btn.small{padding: 6px 12px; font-size: 13px; font-weight: 500;}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-h2 {
-    font-size: 28px;
-    font-weight: 700;
-    color: var(--primary);
-    border-bottom: 2px solid var(--border);
-    padding-bottom: 10px;
-    margin-bottom: 20px;
-}
-h3 { margin-top: 0; margin-bottom: 16px; font-size: 22px; color: var(--text-dark); }
-h4 { margin-top: 0; margin-bottom: 8px; font-size: 18px; color: var(--text-dark); }
-details { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
-details summary { 
-    padding: 14px 18px; 
-    cursor: pointer; 
-    font-weight: 600; 
-    background: #fff; 
-    transition: background-color 0.2s;
-    font-size: 1.1em;
-}
-details summary:hover { background-color: #fcfcfc; }
-details[open] summary { border-bottom: 1px solid var(--border); background-color: #fdfdfd;}
-details .content { padding: 16px; background: var(--bg-light); }
-details .content .btn { margin-top: 10px; }
-details details { margin-top: 10px; }
-details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
-</style>
+<html data-theme="light">
+<head>
+    <meta charset="utf-8" />
+    <title>Multi-Provider (Per-Key API)</title>
+    <style>
+    /* === MỚI: Định nghĩa biến màu cho cả Sáng và Tối === */
+    :root { 
+        --primary: #0d6efd; 
+        --green: #198754; 
+        --red: #dc3545; 
+        --blue: #0d6efd;
+        --gray: #6c757d;
+        --shadow: 0 4px 12px rgba(0,0,0,0.05);
+        
+        /* Light Mode */
+        --bg-light: #f8f9fa; 
+        --border: #dee2e6;
+        --card-bg: #ffffff;
+        --text-dark: #212529;
+        --text-light: #495057;
+        --input-bg: #ffffff;
+        --disabled-bg: #e9ecef;
+        --disabled-text: #6c757d;
+        --code-bg: #e9ecef;
+        --nested-summary-bg: #f0f0f0;
+    }
+    /* === MỚI: Bảng màu Dark Mode === */
+    :root[data-theme="dark"] {
+        --primary: #3a86ff;
+        --green: #20c997;
+        --red: #f07167;
+        --blue: #3a86ff;
+        --gray: #adb5bd;
+        --shadow: 0 4px 12px rgba(0,0,0,0.2);
+
+        --bg-light: #121212;
+        --border: #343a40;
+        --card-bg: #1c1c1e;
+        --text-dark: #e9ecef;
+        --text-light: #adb5bd;
+        --input-bg: #2c2c2e;
+        --disabled-bg: #343a40;
+        --disabled-text: #6c757d;
+        --code-bg: #343a40;
+        --nested-summary-bg: #2c2c2e;
+    }
+
+    body{
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        padding:28px;
+        /* === MỚI: Sử dụng biến CSS === */
+        color: var(--text-dark);
+        background: var(--bg-light);
+        line-height: 1.6;
+        transition: background-color 0.2s, color 0.2s;
+    }
+    .card{
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 20px 24px;
+        margin-bottom: 24px;
+        /* === MỚI: Sử dụng biến CSS === */
+        background: var(--card-bg);
+        box-shadow: var(--shadow);
+        transition: background-color 0.2s, border-color 0.2s;
+    }
+    .row{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;align-items:end}
+    .col-1{grid-column:span 1}.col-2{grid-column:span 2}.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-6{grid-column:span 6}.col-8{grid-column:span 8}.col-12{grid-column:span 12}
+    label{
+        font-size: 13px;
+        font-weight: 600;
+        text-transform: uppercase;
+        color: var(--text-light);
+        margin-bottom: 4px;
+        display: block;
+    }
+    input, select {
+        width: 100%;
+        padding: 10px 14px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        box-sizing: border-box;
+        /* === MỚI: Sử dụng biến CSS === */
+        background: var(--input-bg);
+        color: var(--text-dark);
+        transition: border-color .2s, box-shadow .2s, background-color 0.2s, color 0.2s;
+    }
+    input:focus, select:focus {
+        border-color: var(--primary);
+        box-shadow: 0 0 0 3px rgba(13,110,253,0.25);
+        outline: none;
+    }
+    input:disabled, input[readonly] { 
+        background: var(--disabled-bg); 
+        color: var(--disabled-text); 
+        cursor: not-allowed; 
+    }
+    table{width:100%;border-collapse:collapse;margin-top: 10px;}
+    th,td{padding:12px 14px;border-bottom:1px solid var(--border);text-align:left;word-break:break-all;vertical-align: middle;}
+    th { font-size: 12px; text-transform: uppercase; color: var(--text-light); }
+    /* === MỚI: Thêm màu cho code === */
+    code{background:var(--code-bg); color: var(--primary); padding:3px 6px;border-radius:6px;font-family:monospace;font-size: 0.9em;}
+    
+    button,.btn{
+        padding: 10px 16px;
+        border-radius: 8px;
+        border: 1px solid transparent;
+        background: var(--primary);
+        color: #fff;
+        cursor: pointer;
+        text-decoration: none;
+        font-weight: 600;
+        transition: background-color .2s, transform .1s;
+        display: inline-block;
+        text-align: center;
+        margin-bottom: 4px;
+    }
+    button:hover, .btn:hover {
+        filter: brightness(1.1);
+        transform: translateY(-1px);
+    }
+    .btn.red{background:var(--red);border-color:var(--red)}
+    .btn.blue{background:var(--blue);border-color:var(--blue)}
+    .btn.green{background:var(--green);border-color:var(--green)}
+    .btn.gray{background:var(--gray);border-color:var(--gray)}
+    .btn.small{padding: 6px 12px; font-size: 13px; font-weight: 500;}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    h2 {
+        font-size: 28px;
+        font-weight: 700;
+        color: var(--primary);
+        border-bottom: 2px solid var(--border);
+        padding-bottom: 10px;
+        margin-bottom: 20px;
+    }
+    h3 { margin-top: 0; margin-bottom: 16px; font-size: 22px; color: var(--text-dark); }
+    h4 { margin-top: 0; margin-bottom: 8px; font-size: 18px; color: var(--text-dark); }
+    details { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+    details summary { 
+        padding: 14px 18px; 
+        cursor: pointer; 
+        font-weight: 600; 
+        background: var(--card-bg); 
+        transition: background-color 0.2s;
+        font-size: 1.1em;
+    }
+    details summary:hover { filter: brightness(0.98); }
+    details[open] summary { border-bottom: 1px solid var(--border); background-color: var(--card-bg);}
+    details .content { padding: 16px; background: var(--bg-light); }
+    details .content .btn { margin-top: 10px; }
+    details details { margin-top: 10px; }
+    details details summary { background: var(--nested-summary-bg); border-radius: 8px 8px 0 0; }
+    </style>
+    
+    <script>
+    (function() {
+        var mode = document.cookie.split('; ').find(row => row.startsWith('admin_mode='))?.split('=')[1] || 'light';
+        document.documentElement.setAttribute('data-theme', mode);
+    })();
+    </script>
 </head>
 <body>
   <h2>⚙️ Multi-Provider (Quản lý theo Website)</h2>
@@ -427,12 +475,17 @@ details details summary { background: #f0f0f0; border-radius: 8px 8px 0 0; }
   <div class="card" style="padding: 16px;">
     <div class="row" style="align-items: center;">
       <div class="col-4">
-        <label for="theme-switcher">Chọn Giao Diện</label>
-        <select id="theme-switcher" class="mono">
-          <option value="default" {% if theme == 'default' %}selected{% endif %}>Mặc định</option>
-          <option value="snow" {% if theme == 'snow' %}selected{% endif %}>Tuyết Rơi ❄️</option>
-          <option value="matrix" {% if theme == 'matrix' %}selected{% endif %}>Matrix (Ma Trận 💻)</option>
-          <option value="sakura" {% if theme == 'sakura' %}selected{% endif %}>Hoa Anh Đào 🌸</option>
+        <label for="mode-switcher">Chọn Nền</label>
+        <select id="mode-switcher" class="mono">
+          <option value="light" {% if mode == 'light' %}selected{% endif %}>Sáng (Mặc định) ☀️</option>
+          <option value="dark" {% if mode == 'dark' %}selected{% endif %}>Tối 🌙</option>
+        </select>
+      </div>
+      <div class="col-4">
+        <label for="effect-switcher">Chọn Hiệu Ứng</label>
+        <select id="effect-switcher" class="mono">
+          <option value="default" {% if effect == 'default' %}selected{% endif %}>Không có</option>
+          <option value="snow" {% if effect == 'snow' %}selected{% endif %}>Tuyết Rơi (Xanh) ❄️</option>
         </select>
       </div>
     </div>
@@ -519,15 +572,29 @@ document.getElementById('reset-form-btn').addEventListener('click', function() {
     setLockedFields(false);
 });
 
-// Logic cho Theme Switcher
-document.getElementById('theme-switcher').addEventListener('change', function() {
-    const selectedTheme = this.value;
-    document.cookie = `admin_theme=${selectedTheme};path=/;max-age=31536000;SameSite=Lax`;
+// ==========================================================
+// === MỚI: Cập nhật Logic cho 2 Switchers ===
+// ==========================================================
+
+// Logic cho Effect Switcher
+document.getElementById('effect-switcher').addEventListener('change', function() {
+    const selectedEffect = this.value;
+    // Đổi tên cookie
+    document.cookie = `admin_effect=${selectedEffect};path=/;max-age=31536000;SameSite=Lax`;
     location.reload();
+});
+
+// Logic cho Mode Switcher (Sáng/Tối)
+document.getElementById('mode-switcher').addEventListener('change', function() {
+    const selectedMode = this.value;
+    // Lưu cookie
+    document.cookie = `admin_mode=${selectedMode};path=/;max-age=31536000;SameSite=Lax`;
+    // Áp dụng ngay lập tức
+    document.documentElement.setAttribute('data-theme', selectedMode);
 });
 </script>
 
-{% if theme == 'snow' %}
+{% if effect == 'snow' %}
 <script id="snow-effect-script">
 (function() {
     if (document.getElementById('snow-canvas')) return; 
@@ -559,7 +626,8 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
     }
     function draw() {
         ctx.clearRect(0, 0, W, H);
-        ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
+        /* === MỚI: Đổi màu tuyết thành XANH NHẠT === */
+        ctx.fillStyle = "rgba(173, 216, 230, 0.8)"; /* lightblue */
         ctx.beginPath();
         for(var i = 0; i < mp; i++) {
             var f = flakes[i];
@@ -598,135 +666,8 @@ document.getElementById('theme-switcher').addEventListener('change', function() 
 </script>
 {% endif %}
 
-{% if theme == 'matrix' %}
-<script id="matrix-effect-script">
-(function() {
-    if (document.getElementById('matrix-canvas')) return;
-    var canvas = document.createElement('canvas');
-    canvas.id = 'matrix-canvas';
-    canvas.style.position = 'fixed';
-    canvas.style.top = '0';
-    canvas.style.left = '0';
-    canvas.style.width = '100vw';
-    canvas.style.height = '100vh';
-    canvas.style.pointerEvents = 'none';
-    canvas.style.zIndex = '9999';
-    document.body.appendChild(canvas);
-    
-    var ctx = canvas.getContext('2d');
-    var W = window.innerWidth;
-    var H = window.innerHeight;
-    canvas.width = W;
-    canvas.height = H;
-
-    var font_size = 14;
-    var columns = Math.floor(W / font_size);
-    var drops = [];
-    for(var x = 0; x < columns; x++) drops[x] = 1; 
-    var chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890@#$%^&*()";
-    chars = chars.split("");
-
-    function draw() {
-        ctx.fillStyle = "rgba(0, 0, 0, 0.05)"; 
-        ctx.fillRect(0, 0, W, H);
-        
-        ctx.fillStyle = "#0F0"; // Green color
-        ctx.font = font_size + "px monospace";
-
-        for(var i = 0; i < drops.length; i++) {
-            var text = chars[Math.floor(Math.random() * chars.length)];
-            ctx.fillText(text, i * font_size, drops[i] * font_size);
-            
-            if(drops[i] * font_size > H && Math.random() > 0.975) {
-                drops[i] = 0;
-            }
-            drops[i]++;
-        }
-    }
-    var matrixInterval = setInterval(draw, 40);
-    window.addEventListener('resize', function() {
-        W = window.innerWidth; H = window.innerHeight;
-        canvas.width = W; canvas.height = H;
-        columns = Math.floor(W / font_size);
-        drops = [];
-        for(var x = 0; x < columns; x++) drops[x] = 1; 
-    });
-})();
-</script>
-{% endif %}
-
-{% if theme == 'sakura' %}
-<script id="sakura-effect-script">
-(function() {
-    if (document.getElementById('sakura-canvas')) return; 
-    var canvas = document.createElement('canvas');
-    canvas.id = 'sakura-canvas';
-    canvas.style.position = 'fixed';
-    canvas.style.top = '0';
-    canvas.style.left = '0';
-    canvas.style.width = '100vw';
-    canvas.style.height = '100vh';
-    canvas.style.pointerEvents = 'none';
-    canvas.style.zIndex = '9999';
-    document.body.appendChild(canvas);
-
-    var ctx = canvas.getContext('2d');
-    var W = window.innerWidth;
-    var H = window.innerHeight;
-    canvas.width = W;
-    canvas.height = H;
-    var mp = 75; // Ít hoa hơn tuyết
-    var petals = [];
-    for(var i = 0; i < mp; i++) {
-        petals.push({
-            x: Math.random() * W,
-            y: Math.random() * H,
-            r: Math.random() * 4 + 1,
-            d: Math.random() * mp,
-            c: (Math.random() > 0.5) ? "rgba(255, 192, 203, 0.8)" : "rgba(255, 255, 255, 0.8)" // Pink or White
-        });
-    }
-    function draw() {
-        ctx.clearRect(0, 0, W, H);
-        for(var i = 0; i < mp; i++) {
-            var p = petals[i];
-            ctx.fillStyle = p.c;
-            ctx.beginPath();
-            ctx.moveTo(p.x, p.y);
-            ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2, true);
-            ctx.fill();
-        }
-        update();
-    }
-    var angle = 0;
-    function update() {
-        angle += 0.01;
-        for(var i = 0; i < mp; i++) {
-            var p = petals[i];
-            p.y += Math.cos(angle + p.d) + 1 + p.r / 2;
-            p.x += Math.sin(angle) * 2;
-            if(p.x > W + 5 || p.x < -5 || p.y > H) {
-                if(i % 3 > 0) { 
-                    petals[i] = {x: Math.random() * W, y: -10, r: p.r, d: p.d, c: p.c};
-                } else {
-                    if(Math.sin(angle) > 0) {
-                        petals[i] = {x: -5, y: Math.random() * H, r: p.r, d: p.d, c: p.c};
-                    } else {
-                        petals[i] = {x: W + 5, y: Math.random() * H, r: p.r, d: p.d, c: p.c};
-                    }
-                }
-            }
-        }
-    }
-    var sakuraInterval = setInterval(draw, 33);
-    window.addEventListener('resize', function() {
-        W = window.innerWidth; H = window.innerHeight;
-        canvas.width = W; canvas.height = H;
-    });
-})();
-</script>
-{% endif %}
-</body></html>
+</body>
+</html>
 """
 
 def find_map_by_key(key: str):
@@ -757,9 +698,11 @@ def admin_index():
         
         grouped_data[folder][provider]["key_list"].append(key)
 
-    # Đọc cookie theme và truyền vào template
-    theme = request.cookies.get('admin_theme', 'default')
-    return render_template_string(ADMIN_TPL, grouped_data=grouped_data, asec=ADMIN_SECRET, theme=theme)
+    # === MỚI: Đọc 2 cookies riêng biệt ===
+    effect = request.cookies.get('admin_effect', 'default') # Cookie cho hiệu ứng
+    mode = request.cookies.get('admin_mode', 'light') # Cookie cho Sáng/Tối
+    
+    return render_template_string(ADMIN_TPL, grouped_data=grouped_data, asec=ADMIN_SECRET, effect=effect, mode=mode)
 
 @app.route("/admin/keymap", methods=["POST"])
 def admin_add_keymap():
@@ -826,7 +769,7 @@ def admin_backup_download():
         
         data_to_export = [dict(row) for row in maps]
         
-        timestamp = datetime.datetime.now().strftime("%Ym%d_%H%M%S")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"keymaps_backup_{timestamp}.json"
         
         response = jsonify(data_to_export)
