@@ -1,1244 +1,2565 @@
 import os
+import json
 import sqlite3
+import datetime
 import threading
 import time
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
-
+import random
+from contextlib import closing
+from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string, flash, make_response
 import requests
-from flask import (
-    Flask,
-    render_template_string,
-    request,
-    redirect,
-    url_for,
-    session,
-    flash,
-    Response,
-)
 
-# =========================
-# CẤU HÌNH CƠ BẢN
-# =========================
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 1: CẤU HÌNH HỆ THỐNG (SYSTEM CONFIGURATION)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
 
-APP_TITLE = "Quantum Balance Watcher" # Thay đổi tiêu đề app
-# APP_TITLE = "Balance Watcher Universe"
+# Đường dẫn file Database SQLite
+# Lưu ý: Trên Render Free, file này sẽ bị reset khi server khởi động lại.
+# Chúng ta dùng cơ chế Auto Restore từ Secret File để khắc phục điều này.
+DB = os.getenv("DB_PATH", "store.db") 
 
-# Một pass duy nhất:
-# - ADMIN_PASSWORD: dùng để login dashboard
-# - SECRET_KEY: nếu không set riêng thì dùng luôn ADMIN_PASSWORD
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
-SECRET_KEY = os.getenv("SECRET_KEY", ADMIN_PASSWORD)
+# Đường dẫn file Secret Backup trên Render (Lấy từ biến môi trường)
+# File này được mount từ "Secret Files" của Render, dùng để lưu dữ liệu bền vững.
+# Giá trị mặc định: /etc/secrets/backupapitaphoa.json
+SECRET_BACKUP_FILE_PATH = os.getenv("SECRET_BACKUP_FILE_PATH", "/etc/secrets/backupapitaphoa.json")
 
-# DB path (Render dùng /data cho persistent)
-DATA_DIR = "/data"
-if not os.path.isdir(DATA_DIR):
-    DATA_DIR = "."
-DB_PATH = os.path.join(DATA_DIR, "balance_watcher.db")
+# Tên file backup tự động sinh ra (Lưu tạm thời trên ổ cứng)
+# Dùng để tải về máy tính thông qua Admin Dashboard
+AUTO_BACKUP_FILE = "auto_backup.json"
 
-# Mặc định nếu người dùng chưa nhập trong giao diện
-POLL_INTERVAL_DEFAULT = 30  # giây tối thiểu 5s
+# Mật khẩu quản trị viên (Admin)
+# Hãy thay đổi giá trị này trong Environment Variables trên Render để bảo mật
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
 
+# Thời gian chờ (Timeout) mặc định cho các request API ra ngoài (tính bằng giây)
+DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "5")) 
+
+# Thời gian (giây) giữa các lần kiểm tra Proxy tự động
+PROXY_CHECK_INTERVAL = 15 
+
+# Khởi tạo ứng dụng Flask
 app = Flask(__name__)
-app.secret_key = SECRET_KEY
+app.secret_key = ADMIN_SECRET 
 
+# Biến toàn cục lưu trữ cấu hình Proxy đang hoạt động
+# Được sử dụng bởi các luồng check proxy và API mua hàng
+CURRENT_PROXY_SET = {
+    "http": None, 
+    "https": None
+}
+CURRENT_PROXY_STRING = "" 
+
+# Khóa thread (Mutex) để tránh xung đột khi nhiều luồng cùng ghi vào Database
 db_lock = threading.Lock()
-watcher_started = False
-watcher_running = False
 
-# =========================
-# Múi giờ Việt Nam
-# =========================
-try:
-    from zoneinfo import ZoneInfo
-    VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
-except Exception:
-    VN_TZ = timezone(timedelta(hours=7))
+# Cờ kiểm soát trạng thái các luồng chạy ngầm
+# Giúp đảm bảo mỗi luồng chỉ được khởi động một lần duy nhất
+proxy_checker_started = False
+ping_service_started = False
+auto_backup_started = False
 
-def fmt_time_label_vn(dt_utc: datetime) -> str:
-    """UTC -> 'HH:MM DD/MM/YYYY (VN)'"""
+
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 2: TIỆN ÍCH THỜI GIAN (TIMEZONE UTILS)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+
+def get_vn_time():
+    """
+    Hàm lấy thời gian hiện tại theo múi giờ Việt Nam (UTC+7).
+    Server Render thường chạy giờ UTC (0), nên cần cộng thêm 7 giờ.
+    
+    Returns:
+        str: Chuỗi thời gian định dạng 'YYYY-MM-DD HH:MM:SS'
+    """
+    # Lấy giờ UTC hiện tại
+    utc_now = datetime.datetime.utcnow()
+    
+    # Cộng thêm 7 giờ
+    vn_now = utc_now + datetime.timedelta(hours=7)
+    
+    # Trả về chuỗi định dạng
+    return vn_now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 3: CÁC HÀM XỬ LÝ DATABASE (DB UTILS)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+
+def db():
+    """
+    Tạo kết nối mới đến Database SQLite.
+    Sử dụng sqlite3.Row để có thể truy cập dữ liệu theo tên cột (dict-like).
+    """
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row 
+    return con
+
+def _ensure_col(con, table, col, decl):
+    """
+    Hàm phụ trợ để đảm bảo một cột tồn tại trong bảng.
+    Dùng để tự động cập nhật cấu trúc bảng (Migration) khi code thay đổi.
+    """
     try:
-        local = dt_utc.replace(tzinfo=timezone.utc).astimezone(VN_TZ)
+        query = f"ALTER TABLE {table} ADD COLUMN {col} {decl}"
+        con.execute(query)
     except Exception:
-        local = dt_utc
-    return local.strftime("%H:%M %d/%m/%Y (VN)")
+        # Bỏ qua lỗi nếu cột đã tồn tại
+        pass
 
-def parse_iso_utc(s: str) -> Optional[datetime]:
-    """ISO8601 (có thể có 'Z') -> datetime UTC"""
-    if not s:
-        return None
-    try:
-        si = s.rstrip("Z")
-        dt = datetime.fromisoformat(si)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        else:
-            dt = dt.astimezone(timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-# =========================
-# HELPERS: format tiền
-# =========================
-def fmt_amount(v: float) -> str:
-    """1000000.0 -> 1,000,000đ"""
-    try:
-        return f"{float(v):,.0f}đ"
-    except Exception:
-        try:
-            return f"{float(str(v).replace(',', '')):,.0f}đ"
-        except Exception:
-            return f"{v}đ"
-
-def to_float(s: Optional[str], default: Optional[float] = None) -> Optional[float]:
-    try:
-        if s is None:
-            return default
-        s = s.replace(",", "").strip()
-        return float(s)
-    except Exception:
-        return default
-
-# =========================
-# TEMPLATE: LOGIN (UI vũ trụ đã chỉnh sửa)
-# =========================
-LOGIN_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <title>Đăng nhập | {{ title }}</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body {
-            background-color: #020817;
-            background-image:
-                radial-gradient(circle at 0 0, rgba(129, 140, 248, 0.18), transparent 55%),
-                radial-gradient(circle at 100% 0, rgba(45, 212, 191, 0.10), transparent 55%),
-                radial-gradient(circle at 100% 100%, rgba(236, 72, 153, 0.10), transparent 55%);
-            min-height: 100vh;
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-        }
-        .admin-group {
-            display: inline-flex;
-            align-items: center;
-        }
-    </style>
-</head>
-<body class="flex items-center justify-center">
-    <div class="max-w-md w-full mx-4">
-        <div class="bg-slate-900/80 border border-slate-700/80 rounded-3xl shadow-2xl p-8 backdrop-blur-xl relative overflow-hidden">
-            <div class="absolute -top-10 -right-10 w-32 h-32 bg-indigo-500/20 rounded-full blur-3xl"></div>
-            <div class="absolute -bottom-16 -left-10 w-40 h-40 bg-fuchsia-500/10 rounded-full blur-3xl"></div>
-
-            <div class="flex items-start gap-3 mb-2 relative z-10">
-                <div class="w-10 h-10 rounded-full bg-gradient-to-tr from-indigo-400 via-sky-400 to-fuchsia-400 flex items-center justify-center text-white text-xl shadow-lg mt-0.5">
-                    ∞
-                </div>
-                <div>
-                    <div class="text-sm uppercase tracking-[0.18em] text-slate-400">QUANTUM SECURITY GATE</div>
-                    <div class="text-sm text-slate-500 flex items-center gap-1">
-                        Hệ thống được bảo dưỡng & phát triển bởi
-                        <span class="admin-group">
-                            <span class="font-semibold text-cyan-400">Admin Văn Linh</span>
-                            <span class="w-4 h-4 rounded-full bg-gradient-to-tr from-sky-400 to-blue-600 flex items-center justify-center text-[10px] text-white shadow-lg ml-1">✓</span>
-                        </span>
-                    </div>
-                </div>
-            </div>
-
-            <h1 class="mt-4 text-2xl font-semibold text-slate-50 tracking-tight">
-                Đăng nhập Bảng điều khiển API
-            </h1>
-            <p class="mt-1 text-sm text-slate-400">
-                Nhập mật khẩu quản trị để truy cập DashBoard quản lý các API.
-            </p>
-
-            {% with messages = get_flashed_messages(with_categories=true) %}
-              {% if messages %}
-                <div class="mt-4 space-y-2">
-                  {% for category, message in messages %}
-                    <div class="px-3 py-2 rounded-2xl text-xs
-                        {% if category == 'error' %}bg-red-900/60 text-red-200 border border-red-500/40
-                        {% else %}bg-emerald-900/40 text-emerald-200 border border-emerald-500/30{% endif %}">
-                      {{ message }}
-                    </div>
-                  {% endfor %}
-                </div>
-              {% endif %}
-            {% endwith %}
-
-            <form method="post" class="mt-5 space-y-3 relative z-10">
-                <label class="block text-xs font-medium text-slate-400 mb-1">
-                    Mật khẩu Admin
-                </label>
-                <input
-                    type="password"
-                    name="password"
-                    required
-                    placeholder="ADMIN_PASSWORD trên Render"
-                    class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-slate-100 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400 placeholder-slate-500 shadow-inner"
-                />
-                <button
-                    type="submit"
-                    class="w-full mt-2 inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 text-white text-sm font-medium shadow-xl hover:shadow-2xl hover:-translate-y-0.5 transition-all"
-                >
-                    🚀 Vào Dashboard Vũ Trụ
-                </button>
-            </form>
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-# =========================
-# TEMPLATE: DASHBOARD (giờ VN)
-# =========================
-DASHBOARD_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <title>{{ title }} | Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        body { 
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-            background-color: #020817;
-            background-image:
-                radial-gradient(circle at 0 0, rgba(129, 140, 248, 0.18), transparent 55%),
-                radial-gradient(circle at 100% 0, rgba(45, 212, 191, 0.10), transparent 55%),
-                radial-gradient(circle at 100% 100%, rgba(236, 72, 153, 0.10), transparent 55%);
-            min-height: 100vh;
-        }
-        .scrollbar-thin::-webkit-scrollbar { height:5px; width:5px; }
-        .scrollbar-thin::-webkit-scrollbar-thumb { background-color:rgba(148,163,253,0.4); border-radius:999px; }
-        .scrollbar-thin::-webkit-scrollbar-track { background-color:transparent; }
-    </style>
-</head>
-<body class="text-slate-100">
-<div class="min-h-screen px-4 py-6 md:px-8 md:py-8">
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        <div class="max-w-6xl mx-auto mb-4 space-y-2">
-          {% for category, message in messages %}
-            <div class="px-4 py-2 rounded-2xl text-xs border
-                {% if category == 'error' %}bg-red-900/60 text-red-200 border-red-500/40
-                {% else %}bg-emerald-900/40 text-emerald-200 border-emerald-500/30{% endif %}">
-              {{ message }}
-            </div>
-          {% endfor %}
-        </div>
-      {% endif %}
-    {% endwith %}
-
-    <div class="max-w-6xl mx-auto mb-5 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div>
-            <div class="flex items-center gap-3">
-                <div class="w-9 h-9 rounded-full bg-gradient-to-tr from-indigo-400 via-sky-400 to-fuchsia-400 flex items-center justify-center text-white text-2xl shadow-lg">
-                    ∞
-                </div>
-                <div>
-                    <div class="text-[10px] uppercase tracking-[0.18em] text-slate-400">
-                        QUANTUM BALANCE MONITOR
-                    </div>
-                    <div class="flex items-center gap-2 text-[11px] text-slate-500">
-                        Bot được bảo dưỡng &amp; phát triển bởi
-                        <span class="font-semibold text-cyan-400">Admin Văn Linh</span>
-                        <span class="w-4 h-4 rounded-full bg-gradient-to-tr from-sky-400 to-blue-600 flex items-center justify-center text-[10px] text-white shadow-lg">✓</span>
-                    </div>
-                </div>
-            </div>
-            <h1 class="mt-3 text-3xl font-semibold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-indigo-300 via-sky-300 to-fuchsia-300">
-                Admin Panel Dashboard
-            </h1>
-            <p class="mt-1 text-xs text-slate-400 max-w-xl">
-                Theo dõi biến động số dư nhiều website, phân loại tự động
-                <span class="text-emerald-400 font-semibold">CỘNG TIỀN</span> /
-                <span class="text-rose-400 font-semibold">THANH TOÁN</span> và gửi cảnh báo tức thời về Telegram.
-            </p>
-        </div>
-        <div class="flex flex-col items-start md:items-end gap-1 text-[10px] text-slate-500">
-            <div>Chu kỳ quét hiện tại:
-                <span class="text-indigo-300 font-semibold">{{ effective_poll_interval }} giây</span>
-            </div>
-            <div>Ngưỡng cảnh báo chung:
-                {% if global_threshold %}
-                    <span class="text-rose-300 font-semibold">{{ "{:,.0f}".format(global_threshold|float) }}đ</span>
-                {% else %}
-                    <span class="text-slate-400">chưa đặt</span>
-                {% endif %}
-            </div>
-            <div>Trạng thái watcher:
-                {% if watcher_running %}
-                    <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-900/60 text-emerald-300 text-[10px]">
-                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> Đang chạy
-                    </span>
-                {% else %}
-                    <span class="inline-flex items-center px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 text-[10px]">
-                        Tạm dừng
-                    </span>
-                {% endif %}
-            </div>
-            <div>
-                <a href="{{ url_for('logout') }}" class="text-slate-500 hover:text-fuchsia-400 transition text-[10px]">
-                    Đăng xuất
-                </a>
-            </div>
-        </div>
-    </div>
-
-    <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-5 items-start">
-        <div class="space-y-5">
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between gap-2 mb-3">
-                    <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Cài đặt chung</h2>
-                    <span class="px-2 py-0.5 rounded-full bg-slate-800/90 text-[9px] text-slate-400">
-                        Telegram: 1 Chat ID, nhiều Bot Token
-                    </span>
-                </div>
-                <form method="post" action="{{ url_for('save_settings') }}" class="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div class="md:col-span-2">
-                        <label class="block text-[10px] text-slate-400 mb-1">TELEGRAM_CHAT_ID (nhận cảnh báo)</label>
-                        <input type="text" name="default_chat_id"
-                            value="{{ settings.default_chat_id or '' }}"
-                            placeholder="VD: 123456789 hoặc -100123456789"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                    </div>
-
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Bot mặc định để gửi (tuỳ chọn)</label>
-                        <select name="default_bot_id"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                            <option value="">-- Gửi bằng TẤT CẢ bot --</option>
-                            {% for bot in bots %}
-                                <option value="{{ bot.id }}" {% if settings.default_bot_id and settings.default_bot_id == bot.id %}selected{% endif %}>
-                                    {{ bot.bot_name }} (..{{ bot.bot_token[-6:] }})
-                                </option>
-                            {% endfor %}
-                        </select>
-                    </div>
-
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Chu kỳ quét (giây)</label>
-                        <input type="number" min="5" step="1" name="poll_interval"
-                            value="{{ settings.poll_interval or '' }}"
-                            placeholder="VD: 15, 30, 60..."
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-400">
-                    </div>
-
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Ngưỡng cảnh báo chung (VND)</label>
-                        <input type="text" name="global_threshold"
-                            value="{{ settings.global_threshold or '' }}"
-                            placeholder="VD: 1,000,000 (bỏ trống nếu không cảnh báo)"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:border-rose-400">
-                    </div>
-
-                    <div class="md:col-span-2">
-                        <button type="submit"
-                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-indigo-500 via-sky-500 to-fuchsia-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                            💾 Lưu cấu hình
-                        </button>
-                    </div>
-                </form>
-            </div>
-
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-cyan-300 uppercase tracking-[0.16em]">Quản lý Bot Telegram</h2>
-                </div>
-                <form method="post" action="{{ url_for('add_bot') }}" class="space-y-3 mb-4">
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Tên bot (hiển thị)</label>
-                        <input type="text" name="bot_name" required
-                            placeholder="VD: Bot Cảnh báo chính"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-cyan-400">
-                    </div>
-                    <div>
-                        <label class="block text-[10px] text-slate-400 mb-1">Token bot</label>
-                        <input type="text" name="bot_token" required
-                            placeholder="123456:ABC-DEF..."
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-cyan-400">
-                    </div>
-                    <button type="submit"
-                        class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                        ➕ Thêm Bot
-                    </button>
-                </form>
-                <div class="space-y-2 max-h-40 overflow-y-auto scrollbar-thin">
-                    {% for bot in bots %}
-                    <div class="flex items-center justify-between px-3 py-2 rounded-2xl bg-slate-950/70 border border-slate-800 text-[10px]">
-                        <div class="flex flex-col">
-                            <span class="text-slate-100 font-medium">{{ bot.bot_name }}</span>
-                            <span class="text-slate-500 text-[9px]">...{{ bot.bot_token[-12:] }}</span>
-                        </div>
-                        <div class="flex items-center gap-2">
-                            <form method="post" action="{{ url_for('test_bot') }}">
-                                <input type="hidden" name="bot_id" value="{{ bot.id }}">
-                                <button class="px-2 py-1 rounded-xl bg-slate-800 text-cyan-300 hover:bg-cyan-600/20 hover:text-cyan-200 text-[9px]">
-                                    Test
-                                </button>
-                            </form>
-                            <form method="post" action="{{ url_for('delete_bot') }}"
-                                  onsubmit="return confirm('Xoá bot này?');">
-                                <input type="hidden" name="bot_id" value="{{ bot.id }}">
-                                <button class="px-2 py-1 rounded-xl bg-slate-900 text-rose-400 hover:bg-rose-600/20 hover:text-rose-300 text-[9px]">
-                                    Xoá
-                                </button>
-                            </form>
-                        </div>
-                    </div>
-                    {% else %}
-                    <div class="text-[9px] text-slate-500">
-                        Chưa có bot nào. Thêm ít nhất 1 bot để bắt đầu gửi cảnh báo.
-                    </div>
-                    {% endfor %}
-                </div>
-            </div>
-
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-fuchsia-300 uppercase tracking-[0.16em]">Backup / Restore</h2>
-                </div>
-
-                <p class="text-[10px] text-slate-400 mb-2">Tải xuống & phục hồi dữ liệu đều ở dạng <span class="text-sky-300 font-semibold">JSON</span>.</p>
-
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-2 mb-4">
-                    <a href="{{ url_for('download_backup') }}"
-                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 hover:border-fuchsia-500/60 hover:text-fuchsia-200 transition-all">
-                        📦 Tải toàn bộ backup (.json)
-                    </a>
-                    <a href="{{ url_for('download_settings') }}"
-                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 transition-all">
-                        ⚙️ Tải settings (.json)
-                    </a>
-                    <a href="{{ url_for('download_bots') }}"
-                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 transition-all">
-                        🤖 Tải bots (.json)
-                    </a>
-                    <a href="{{ url_for('download_apis') }}"
-                       class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-slate-800 text-slate-100 text-[11px] border border-slate-600 hover:bg-slate-700 transition-all md:col-span-3">
-                        🌐 Tải APIs (.json)
-                    </a>
-                </div>
-
-                <form method="post" action="{{ url_for('restore_backup') }}" enctype="multipart/form-data" class="space-y-3">
-                    <label class="block text-[10px] text-slate-400 mb-1">Phục hồi từ file backup (.json)</label>
-                    <input type="file" name="backup_file" accept="application/json"
-                           class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-fuchsia-500 focus:border-fuchsia-400">
-                    <label class="inline-flex items-center gap-2 text-[10px] text-slate-400">
-                        <input type="checkbox" name="wipe" value="1" class="rounded border-slate-600 bg-slate-900">
-                        Xoá hết dữ liệu hiện tại trước khi khôi phục
-                    </label>
-                    <button type="submit"
-                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-fuchsia-500 to-purple-600 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                        ♻️ Restore từ JSON
-                    </button>
-                </form>
-            </div>
-        </div>
-
-        <div class="lg:col-span-2 space-y-5">
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between gap-2 mb-3">
-                    <h2 class="text-sm font-semibold text-sky-300 uppercase tracking-[0.16em]">Thêm API số dư</h2>
-                    <span class="px-2 py-0.5 rounded-full bg-slate-800/90 text-[9px] text-slate-400">
-                        Hỗ trợ nhiều website khác nhau
-                    </span>
-                </div>
-                <form method="post" action="{{ url_for('add_api') }}" class="grid grid-cols-1 md:grid-cols-2 gap-3 text-[10px]">
-                    <div>
-                        <label class="block text-slate-400 mb-1">Tên hiển thị</label>
-                        <input type="text" name="name" required
-                            placeholder="VD: ShopAccMMO chính"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-400">
-                    </div>
-                    <div>
-                        <label class="block text-slate-400 mb-1">URL API kiểm tra số dư</label>
-                        <input type="text" name="url" required
-                            placeholder="https://.../api/profile.php?api_key=XXXX"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-400">
-                    </div>
-                    <div>
-                        <label class="block text-slate-400 mb-1">Trường số dư trong JSON</label>
-                        <input type="text" name="balance_field"
-                            placeholder="Để trống = auto detect (balance / data.balance / ...)"
-                            class="w-full px-3 py-2 rounded-2xl bg-slate-950/80 border border-slate-700 text-[11px] text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-sky-400">
-                    </div>
-                    <div class="flex items-end">
-                        <button type="submit"
-                            class="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-sky-500 to-indigo-500 text-white text-[11px] font-medium shadow-lg hover:-translate-y-0.5 hover:shadow-xl transition-all">
-                            ➕ Thêm API
-                        </button>
-                    </div>
-                </form>
-            </div>
-
-            <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-2xl backdrop-blur-xl">
-                <div class="flex items-center justify-between mb-3">
-                    <h2 class="text-sm font-semibold text-indigo-300 uppercase tracking-[0.16em]">Danh sách API đang theo dõi</h2>
-                    <span class="text-[9px] text-slate-500">
-                        Lần chạy gần nhất: <span class="text-sky-300">{{ last_run_vn or 'chưa có' }}</span>
-                    </span>
-                </div>
-                <div class="overflow-x-auto scrollbar-thin">
-                    <table class="min-w-full text-[10px]">
-                        <thead class="bg-slate-950/80">
-                            <tr>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">ID</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Tên</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">URL</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Trường</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Số dư gần nhất</th>
-                                <th class="px-3 py-2 text-left text-slate-400 uppercase tracking-[0.14em]">Cập nhật</th>
-                                <th class="px-3 py-2 text-right text-slate-400 uppercase tracking-[0.14em]"></th>
-                            </tr>
-                        </thead>
-                        <tbody class="divide-y divide-slate-800">
-                            {% for api in apis %}
-                            <tr class="hover:bg-slate-800/80 transition-colors">
-                                <td class="px-3 py-2 text-slate-400">#{{ api.id }}</td>
-                                <td class="px-3 py-2 text-slate-100 font-medium">{{ api.name }}</td>
-                                <td class="px-3 py-2 text-slate-500 max-w-[220px] truncate">{{ api.url }}</td>
-                                <td class="px-3 py-2 text-slate-400">{{ api.balance_field or 'auto' }}</td>
-                                <td class="px-3 py-2">
-                                    {% if api.last_balance is not none %}
-                                        <span class="inline-flex px-2 py-0.5 rounded-full bg-emerald-900/40 text-emerald-300">
-                                            {{ "{:,.0f}".format(api.last_balance|float) }}đ
-                                        </span>
-                                    {% else %}
-                                        <span class="inline-flex px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">
-                                            chưa có
-                                        </span>
-                                    {% endif %}
-                                </td>
-                                <td class="px-3 py-2 text-slate-500">
-                                    {{ api.last_change_vn or '-' }}
-                                </td>
-                                <td class="px-3 py-2 text-right">
-                                    <form method="post" action="{{ url_for('delete_api', api_id=api.id) }}"
-                                          onsubmit="return confirm('Xoá API này khỏi danh sách theo dõi?');">
-                                        <button class="px-2 py-1 rounded-xl bg-slate-950 text-rose-400 hover:bg-rose-600/20 hover:text-rose-300">
-                                            ✖
-                                        </button>
-                                    </form>
-                                </td>
-                            </tr>
-                            {% else %}
-                            <tr>
-                                <td colspan="7" class="px-3 py-4 text-center text-slate-500 text-[10px]">
-                                    Chưa có API nào. Thêm ít nhất một API để bắt đầu giám sát.
-                                </td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-</body>
-</html>
-"""
-
-# =========================
-# DB HELPER
-# =========================
 def init_db():
+    """
+    Hàm khởi tạo Database quan trọng nhất.
+    Chức năng:
+    1. Tạo các bảng nếu chưa tồn tại.
+    2. Cập nhật cấu trúc bảng cũ (Migration).
+    3. Khởi tạo các giá trị cấu hình mặc định.
+    4. Tự động khôi phục dữ liệu từ Secret File nếu DB trống (quan trọng cho Render).
+    """
     with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
+        with db() as con:
+            print(f"INFO: Đang kết nối và khởi tạo Database tại: {DB}")
+            
+            # -------------------------------------------------------
+            # TẠO BẢNG KEYMAPS (Quản lý Key bán hàng)
+            # -------------------------------------------------------
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS keymaps(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sku TEXT NOT NULL,
+                    input_key TEXT NOT NULL UNIQUE,
+                    product_id INTEGER NOT NULL,
+                    is_active INTEGER DEFAULT 1,
+                    group_name TEXT,
+                    provider_type TEXT NOT NULL DEFAULT 'mail72h',
+                    base_url TEXT,
+                    api_key TEXT
+                )
+            """)
+            
+            # -------------------------------------------------------
+            # TẠO BẢNG CONFIG (Lưu cấu hình hệ thống)
+            # -------------------------------------------------------
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS config(
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            
+            # -------------------------------------------------------
+            # TẠO BẢNG PROXIES (Quản lý danh sách Proxy)
+            # -------------------------------------------------------
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS proxies(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proxy_string TEXT NOT NULL UNIQUE, 
+                    is_live INTEGER DEFAULT 0,
+                    latency REAL DEFAULT 9999.0, 
+                    last_checked TEXT
+                )
+            """)
+            
+            # -------------------------------------------------------
+            # TẠO BẢNG LOCAL STOCK (Kho hàng thủ công)
+            # -------------------------------------------------------
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS local_stock(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    added_at TEXT
+                )
+            """)
+            
+            # -------------------------------------------------------
+            # CẬP NHẬT CẤU TRÚC BẢNG (MIGRATION)
+            # -------------------------------------------------------
+            _ensure_col(con, "keymaps", "group_name", "TEXT")
+            _ensure_col(con, "keymaps", "provider_type", "TEXT NOT NULL DEFAULT 'mail72h'")
+            _ensure_col(con, "keymaps", "base_url", "TEXT")
+            _ensure_col(con, "keymaps", "api_key", "TEXT")
+            
+            # Dọn dẹp các cột cũ không còn sử dụng
+            try: 
+                con.execute("ALTER TABLE keymaps DROP COLUMN note")
+            except: 
+                pass
+            
+            try: 
+                con.execute("ALTER TABLE keymaps RENAME COLUMN mail72h_api_key TO api_key")
+            except: 
+                pass
+            
+            # -------------------------------------------------------
+            # KHỞI TẠO DỮ LIỆU MẶC ĐỊNH
+            # -------------------------------------------------------
+            # Xóa cấu hình proxy tạm cũ
+            con.execute("DELETE FROM config WHERE key='current_proxy_string'")
+            
+            # Đảm bảo các key config tồn tại
+            con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("selected_proxy_string", ""))
+            con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("ping_url", ""))
+            con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("ping_interval", "300"))
+            
+            con.commit()
 
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS telegram_bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_name TEXT NOT NULL,
-            bot_token TEXT NOT NULL UNIQUE
-        )
-        """)
+            # -------------------------------------------------------
+            # LOGIC AUTO RESTORE (KHÔI PHỤC DỮ LIỆU TỰ ĐỘNG)
+            # -------------------------------------------------------
+            # Kiểm tra xem bảng keymaps có trống không.
+            keymap_count = con.execute("SELECT COUNT(*) FROM keymaps").fetchone()[0]
+            
+            if keymap_count == 0:
+                print("WARNING: Database đang trống (Do Render vừa Restart).")
+                print("INFO: Đang tìm kiếm file Backup bí mật để khôi phục dữ liệu...")
+                
+                if SECRET_BACKUP_FILE_PATH and os.path.exists(SECRET_BACKUP_FILE_PATH):
+                    print(f"INFO: Tìm thấy file backup tại: {SECRET_BACKUP_FILE_PATH}")
+                    try:
+                        with open(SECRET_BACKUP_FILE_PATH, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        
+                        # Chuẩn bị biến chứa dữ liệu
+                        keymaps_to_import = []
+                        config_to_import = {}
+                        proxies_to_import = []
+                        local_stock_to_import = []
 
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
+                        # Kiểm tra định dạng file backup (Cũ hay Mới)
+                        if isinstance(data, list):
+                            # Format cũ: Chỉ là danh sách keymaps
+                            print("INFO: Phát hiện backup định dạng cũ (List).")
+                            keymaps_to_import = data
+                        elif isinstance(data, dict):
+                            # Format mới: Dictionary chứa đầy đủ các bảng
+                            print("INFO: Phát hiện backup định dạng mới (Full Dictionary).")
+                            keymaps_to_import = data.get('keymaps', [])
+                            config_to_import = data.get('config', {})
+                            proxies_to_import = data.get('proxies', [])
+                            local_stock_to_import = data.get('local_stock', [])
 
-        # Khởi tạo key mặc định nếu chưa có
-        for k in ["default_chat_id", "default_bot_id", "last_run", "poll_interval", "global_threshold"]:
-            c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, '')", (k,))
+                        # 1. Restore Keymaps
+                        print(f"INFO: Đang khôi phục {len(keymaps_to_import)} keys...")
+                        for item in keymaps_to_import:
+                            con.execute("""
+                                INSERT OR IGNORE INTO keymaps(
+                                    sku, input_key, product_id, is_active, 
+                                    group_name, provider_type, base_url, api_key
+                                ) 
+                                VALUES(?,?,?,?,?,?,?,?)
+                            """, (
+                                item.get('sku'), 
+                                item.get('input_key'),
+                                item.get('product_id'), 
+                                item.get('is_active', 1),
+                                item.get('group_name', item.get('base_url', 'DEFAULT')), 
+                                item.get('provider_type', 'mail72h'),
+                                item.get('base_url'), 
+                                item.get('api_key')
+                            ))
 
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS apis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            url TEXT NOT NULL,
-            balance_field TEXT NOT NULL,
-            last_balance REAL,
-            last_change TEXT
-        )
-        """)
+                        # 2. Restore Config
+                        print(f"INFO: Đang khôi phục cấu hình...")
+                        for key, value in config_to_import.items():
+                            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+                        
+                        # 3. Restore Proxies
+                        print(f"INFO: Đang khôi phục {len(proxies_to_import)} proxies...")
+                        for item in proxies_to_import:
+                            con.execute("""
+                                INSERT OR IGNORE INTO proxies (proxy_string, is_live, latency, last_checked)
+                                VALUES (?, ?, ?, ?)
+                            """, (
+                                item.get('proxy_string'), 
+                                item.get('is_live', 0),
+                                item.get('latency', 9999.0), 
+                                get_vn_time()
+                            ))
+                            
+                        # 4. Restore Local Stock
+                        print(f"INFO: Đang khôi phục {len(local_stock_to_import)} dòng local stock...")
+                        for item in local_stock_to_import:
+                            con.execute("""
+                                INSERT INTO local_stock (group_name, content, added_at)
+                                VALUES (?, ?, ?)
+                            """, (
+                                item.get('group_name'), 
+                                item.get('content'), 
+                                item.get('added_at')
+                            ))
+                        
+                        con.commit()
+                        print(f"SUCCESS: Đã khôi phục dữ liệu thành công từ Secret File!")
+                        
+                    except Exception as e:
+                        print(f"ERROR: Khôi phục thất bại. Lỗi chi tiết: {e}")
+                else:
+                    print(f"ERROR: Không tìm thấy file backup tại {SECRET_BACKUP_FILE_PATH}. Vui lòng kiểm tra biến môi trường SECRET_BACKUP_FILE_PATH.")
+            else:
+                 print("INFO: Database đã có dữ liệu. Bỏ qua bước khôi phục tự động.")
 
-        conn.commit()
-        conn.close()
 
-def get_settings() -> Dict[str, Optional[str]]:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT key, value FROM settings")
-        rows = c.fetchall()
-        conn.close()
-    return {k: (v if v is not None else "") for k, v in rows}
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 4: XỬ LÝ PROXY (PROXY UTILS)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
 
-def set_setting(key: str, value: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, value),
-        )
-        conn.commit()
-        conn.close()
+def format_proxy_url(proxy_string: str) -> dict:
+    """
+    Chuyển đổi chuỗi proxy (ip:port hoặc ip:port:user:pass) 
+    thành dictionary URL định dạng chuẩn cho thư viện requests.
+    """
+    if not proxy_string:
+        return {"http": None, "https": None}
+        
+    parts = proxy_string.split(':')
+    formatted_proxy = ""
+    
+    if len(parts) == 2:
+        # Định dạng IP:Port
+        ip, port = parts
+        formatted_proxy = f"http://{ip}:{port}"
+    elif len(parts) == 4:
+        # Định dạng IP:Port:User:Pass
+        ip, port, user, passwd = parts
+        formatted_proxy = f"http://{user}:{passwd}@{ip}:{port}"
+    else:
+        return {"http": None, "https": None}
+        
+    return {"http": formatted_proxy, "https": formatted_proxy}
 
-def get_bots() -> List[Dict[str, Any]]:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM telegram_bots ORDER BY id")
-        rows = c.fetchall()
-        conn.close()
-    return [dict(r) for r in rows]
+def check_proxy_live(proxy_string: str) -> tuple:
+    """
+    Kiểm tra xem một proxy có hoạt động hay không.
+    Gửi request nhẹ đến Google generate_204.
+    Trả về: (is_live (0/1), latency (seconds))
+    """
+    formatted_proxies = format_proxy_url(proxy_string)
+    if not formatted_proxies.get("http"):
+        return (0, 9999.0) 
 
-def get_apis() -> List[Dict[str, Any]]:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM apis ORDER BY id")
-        rows = c.fetchall()
-        conn.close()
-    return [dict(r) for r in rows]
-
-def add_bot_db(name: str, token: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO telegram_bots (bot_name, bot_token) VALUES (?, ?)", (name, token))
-        conn.commit()
-        conn.close()
-
-def delete_bot_db(bot_id: int):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM telegram_bots WHERE id=?", (bot_id,))
-        conn.commit()
-        conn.close()
-
-def add_api_db(name: str, url: str, balance_field: str) -> int:
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO apis (name, url, balance_field, last_balance, last_change) "
-            "VALUES (?, ?, ?, NULL, NULL)",
-            (name, url, balance_field or ""),
-        )
-        new_id = c.lastrowid
-        conn.commit()
-        conn.close()
-    return int(new_id)
-
-def delete_api_db(api_id: int):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM apis WHERE id=?", (api_id,))
-        conn.commit()
-        conn.close()
-
-def update_api_state(api_id: int, balance: float, changed_at: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(
-            "UPDATE apis SET last_balance=?, last_change=? WHERE id=?",
-            (balance, changed_at, api_id),
-        )
-        conn.commit()
-        conn.close()
-
-def wipe_table(table: str):
-    with db_lock:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute(f"DELETE FROM {table}")
-        conn.commit()
-        conn.close()
-
-# =========================
-# UTIL BALANCE
-# =========================
-def _get_by_path(data: Any, path: str) -> Any:
-    if not path:
-        return None
-    cur = data
-    for part in str(path).split("."):
-        if isinstance(cur, dict):
-            cur = cur.get(part)
-        else:
-            return None
-    return cur
-
-def _parse_float_like(val: Any) -> Optional[float]:
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return float(val)
-    s = str(val)
-    cleaned = "".join(ch for ch in s if (ch.isdigit() or ch in ",.-"))
-    if not cleaned:
-        return None
     try:
-        return float(cleaned.replace(",", ""))
+        start_time = time.time()
+        requests.get("http://www.google.com/generate_204", 
+                     proxies=formatted_proxies, 
+                     timeout=DEFAULT_TIMEOUT * 2)
+        latency = time.time() - start_time
+        return (1, latency)
     except Exception:
-        return None
+        return (0, 9999.0)
 
-def _search_balance_recursive(data: Any) -> Optional[float]:
-    """Fallback: quét JSON, ưu tiên key có 'bal', 'sodu', 'money', 'credit'"""
-    if isinstance(data, dict):
-        for k, v in data.items():
-            key = k.lower()
-            if any(x in key for x in ["bal", "sodu", "so_du", "money", "credit"]):
-                num = _parse_float_like(v)
-                if num is not None:
-                    return num
-        for v in data.values():
-            found = _search_balance_recursive(v)
-            if found is not None:
-                return found
-    elif isinstance(data, list):
-        for item in data:
-            found = _search_balance_recursive(item)
-            if found is not None:
-                return found
-    return None
+def update_proxy_state(proxy_string: str, is_live: int, latency: float):
+    """
+    Cập nhật trạng thái (Live/Die) và độ trễ (Latency) của proxy vào Database.
+    """
+    with db_lock:
+        with db() as con:
+            con.execute("""
+                UPDATE proxies SET is_live=?, latency=?, last_checked=?
+                WHERE proxy_string=?
+            """, (is_live, latency, get_vn_time(), proxy_string))
+            con.commit()
 
-def extract_balance_auto(data: Any, balance_field: str) -> Optional[float]:
-    candidates: List[str] = []
-    if balance_field:
-        candidates.append(balance_field.strip())
-    candidates.extend([
-        "balance",
-        "data.balance",
-        "user.balance",
-        "Data.balance",
-        "result.balance",
-        "info.balance",
-        "sodu",
-        "so_du",
-        "data.sodu",
-        "data.so_du",
-        "money",
-        "Money",
-    ])
-    seen = set()
-    for path in candidates:
-        p = path.strip()
-        if not p or p in seen:
-            continue
-        seen.add(p)
-        val = _get_by_path(data, p)
-        num = _parse_float_like(val)
-        if num is not None:
-            return num
-    return _search_balance_recursive(data)
+def get_proxies_from_db():
+    """Lấy toàn bộ danh sách proxy từ DB, sắp xếp ưu tiên Live và nhanh nhất."""
+    with db_lock:
+        with db() as con:
+            return con.execute("SELECT * FROM proxies ORDER BY is_live DESC, latency ASC").fetchall()
 
-def send_telegram(tokens: List[str], chat_id: str, text: str):
-    if not chat_id or not tokens:
+def load_selected_proxy_from_db(con):
+    """Đọc proxy đang được chọn (Active) từ bảng Config."""
+    row = con.execute("SELECT value FROM config WHERE key=?", ("selected_proxy_string",)).fetchone()
+    return row['value'] if row else ""
+
+def set_current_proxy_by_string(proxy_string: str):
+    """
+    Cập nhật biến toàn cục CURRENT_PROXY_SET để sử dụng cho các request API sau này.
+    """
+    global CURRENT_PROXY_SET, CURRENT_PROXY_STRING
+    
+    if not proxy_string:
+        CURRENT_PROXY_SET = {"http": None, "https": None}
+        CURRENT_PROXY_STRING = ""
         return
-    for token in tokens:
-        token = (token or "").strip()
-        if not token:
-            continue
-        try:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            requests.post(
-                url,
-                data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-                timeout=10,
-            )
-        except Exception:
-            continue
 
-# =========================
-# WATCHER THREAD
-# =========================
-def watcher_loop():
-    global watcher_running
-    watcher_running = True
+    formatted = format_proxy_url(proxy_string)
+    if formatted.get("http"):
+        CURRENT_PROXY_SET = formatted
+        CURRENT_PROXY_STRING = proxy_string
+    else:
+        CURRENT_PROXY_SET = {"http": None, "https": None}
+        CURRENT_PROXY_STRING = ""
+
+def select_best_available_proxy(con):
+    """
+    Tự động chọn một proxy Live tốt nhất (Ping thấp nhất) từ Database.
+    Lưu kết quả vào bảng Config.
+    """
+    live_proxy = con.execute(
+        "SELECT proxy_string FROM proxies WHERE is_live=1 ORDER BY latency ASC LIMIT 1"
+    ).fetchone()
+    
+    new_proxy_string = ""
+    if live_proxy:
+        new_proxy_string = live_proxy['proxy_string']
+    
+    set_current_proxy_by_string(new_proxy_string)
+    con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", 
+                ("selected_proxy_string", new_proxy_string))
+    con.commit()
+    return new_proxy_string
+
+def switch_to_next_live_proxy():
+    """
+    Chức năng Failover:
+    Khi proxy hiện tại bị lỗi, hàm này sẽ tìm proxy Live tốt nhất tiếp theo để thay thế.
+    """
+    with db_lock:
+        with db() as con:
+            live_proxies = con.execute("""
+                SELECT proxy_string FROM proxies 
+                WHERE is_live=1 AND proxy_string != ? 
+                ORDER BY latency ASC
+            """, (CURRENT_PROXY_STRING,)).fetchall()
+            
+            new_proxy_string = ""
+            if live_proxies:
+                new_proxy_string = live_proxies[0]['proxy_string']
+            
+            set_current_proxy_by_string(new_proxy_string)
+            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", 
+                        ("selected_proxy_string", new_proxy_string))
+            con.commit()
+            
+            if new_proxy_string:
+                print(f"INFO: (Failover) Đã tự động chuyển sang proxy: {new_proxy_string}")
+            else:
+                print("WARNING: Không tìm thấy proxy nào khả dụng để thay thế.")
+            
+            return new_proxy_string
+
+def run_initial_proxy_scan_and_select():
+    """
+    Chạy quét toàn bộ proxy một lượt khi khởi động ứng dụng.
+    """
+    print("INFO: (Startup) Đang chạy quét kiểm tra proxy lần đầu...")
+    proxies = get_proxies_from_db() 
+    if not proxies:
+        return
+
+    for row in proxies:
+        proxy_string = row['proxy_string']
+        is_live, latency = check_proxy_live(proxy_string)
+        update_proxy_state(proxy_string, is_live, latency)
+        
+    with db_lock:
+        with db() as con:
+            select_best_available_proxy(con)
+
+
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 5: CÁC LUỒNG CHẠY NỀN (BACKGROUND THREADS)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+
+# --- THREAD 1: PROXY CHECKER ---
+def proxy_checker_loop():
+    """
+    Luồng chạy ngầm định kỳ kiểm tra trạng thái của tất cả Proxy.
+    Nếu proxy đang dùng bị chết, nó sẽ tự động đổi sang cái khác.
+    """
+    print(f"INFO: Luồng Proxy Checker đã bắt đầu (Interval: {PROXY_CHECK_INTERVAL}s).")
+    time.sleep(2) 
+
     while True:
         try:
-            settings = get_settings()
-            apis = get_apis()
-            bots = get_bots()
+            proxies = get_proxies_from_db()
+            current_proxy_still_live = False
 
-            # Poll interval do user đặt (fallback mặc định)
-            poll_interval = to_float(settings.get("poll_interval") or "", None)
-            if poll_interval is None or poll_interval < 5:
-                poll_interval = POLL_INTERVAL_DEFAULT
+            for row in proxies:
+                proxy_string = row['proxy_string']
+                # Kiểm tra trạng thái thực tế
+                is_live, latency = check_proxy_live(proxy_string)
+                # Cập nhật vào DB
+                update_proxy_state(proxy_string, is_live, latency)
+                
+                if is_live and proxy_string == CURRENT_PROXY_STRING:
+                    current_proxy_still_live = True
+                
+                time.sleep(0.5) # Delay nhẹ để tránh spam request
 
-            default_chat_id = (settings.get("default_chat_id") or "").strip()
-            default_bot_id = settings.get("default_bot_id") or ""
-            global_threshold = to_float(settings.get("global_threshold") or "", None)
+            # Nếu proxy đang dùng bị chết -> Đổi ngay lập tức
+            if CURRENT_PROXY_STRING and not current_proxy_still_live:
+                print(f"WARNING: Proxy hiện tại {CURRENT_PROXY_STRING} đã chết. Đang tìm proxy thay thế...")
+                switch_to_next_live_proxy() 
+            
+        except Exception as e:
+            print(f"PROXY_CHECKER_ERROR: {e}")
+        
+        time.sleep(PROXY_CHECK_INTERVAL)
 
-            last_run_str = datetime.utcnow().isoformat() + "Z"
-            set_setting("last_run", last_run_str)
-
-            # chọn token
-            tokens_to_use: List[str] = []
-            if default_bot_id:
-                try:
-                    bid = int(default_bot_id)
-                    for b in bots:
-                        if b["id"] == bid:
-                            tokens_to_use = [b["bot_token"]]
-                            break
-                except ValueError:
-                    pass
-            if not tokens_to_use:
-                tokens_to_use = [b["bot_token"] for b in bots]
-
-            for api in apis:
-                api_id = api["id"]
-                name = api["name"]
-                url = api["url"]
-                field = api["balance_field"] or ""
-                old_balance = api["last_balance"]
-
-                if not url:
-                    continue
-
-                # gọi API
-                try:
-                    resp = requests.get(url, timeout=15)
-                    resp.raise_for_status()
-                    data = resp.json()
-                except Exception:
-                    continue
-
-                new_balance = extract_balance_auto(data, field)
-                if new_balance is None:
-                    continue
-
-                now = datetime.utcnow()
-                time_label = fmt_time_label_vn(now)
-
-                # lần đầu chỉ lưu
-                if old_balance is None:
-                    update_api_state(api_id, new_balance, now.isoformat() + "Z")
-                    continue
-
-                old_balance = float(old_balance)
-                diff = new_balance - old_balance
-
-                # Có biến động
-                if abs(diff) >= 1e-9:
-                    if diff < 0:
-                        msg = (
-                            f"🔻 <b>THANH TOÁN THÀNH CÔNG</b> ({name})\n\n"
-                            f"Nội dung: Thanh toán / trừ số dư\n"
-                            f"Tổng trừ: <b>-{fmt_amount(abs(diff))}</b>\n"
-                            f"Số dư cuối: <b>{fmt_amount(new_balance)}</b>\n"
-                            f"Thời gian: {time_label}"
-                        )
-                    else:
-                        msg = (
-                            f"💰 <b>NẠP TIỀN THÀNH CÔNG</b> ({name})\n\n"
-                            f"Nội dung: Nạp tiền vào tài khoản\n"
-                            f"Biến động: <b>+{fmt_amount(diff)}</b>\n"
-                            f"Số dư cuối: <b>{fmt_amount(new_balance)}</b>\n"
-                            f"Thời gian: {time_label}"
-                        )
-
-                    settings = get_settings()  # đọc lại chat/bot khi vừa gửi
-                    default_chat_id = (settings.get("default_chat_id") or "").strip()
-                    if default_chat_id and tokens_to_use:
-                        send_telegram(tokens_to_use, default_chat_id, msg)
-
-                    update_api_state(api_id, new_balance, now.isoformat() + "Z")
-                else:
-                    update_api_state(api_id, new_balance, api.get("last_change") or now.isoformat() + "Z")
-
-                # CẢNH BÁO NGƯỠNG CHUNG
-                if global_threshold is not None:
-                    try:
-                        thr = float(global_threshold)
-                        if old_balance >= thr and new_balance < thr:
-                            alert_msg = (
-                                f"🚨 <b>CẢNH BÁO SỐ DƯ THẤP</b> ({name})\n\n"
-                                f"Tài khoản chỉ còn: <b>{fmt_amount(new_balance)}</b>\n"
-                                f"Ngưỡng cảnh báo: <b>{fmt_amount(thr)}</b>\n"
-                                f"Vui lòng nạp thêm để tránh gián đoạn dịch vụ."
-                            )
-                            settings = get_settings()
-                            default_chat_id = (settings.get("default_chat_id") or "").strip()
-                            if default_chat_id and tokens_to_use:
-                                send_telegram(tokens_to_use, default_chat_id, alert_msg)
-                    except Exception:
-                        pass
-
-        except Exception:
-            pass
-
-        # ngủ theo chu kỳ hiện tại
-        try:
-            settings = get_settings()
-            poll_interval = to_float(settings.get("poll_interval") or "", None)
-            if poll_interval is None or poll_interval < 5:
-                poll_interval = POLL_INTERVAL_DEFAULT
-        except Exception:
-            poll_interval = POLL_INTERVAL_DEFAULT
-        time.sleep(poll_interval)
-
-def start_watcher_once():
-    global watcher_started
-    if not watcher_started:
-        watcher_started = True
-        t = threading.Thread(target=watcher_loop, daemon=True)
+def start_proxy_checker_once():
+    global proxy_checker_started
+    if not proxy_checker_started:
+        proxy_checker_started = True
+        t = threading.Thread(target=proxy_checker_loop, daemon=True)
         t.start()
 
-# =========================
-# AUTH & ROUTES
-# =========================
-def is_logged_in() -> bool:
-    return session.get("logged_in") is True
-
-@app.before_request
-def require_login():
-    if request.endpoint in ("login", "health", "static"):
-        return
-    if not is_logged_in():
-        return redirect(url_for("login"))
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        pwd = request.form.get("password", "")
-        if pwd == ADMIN_PASSWORD:
-            session["logged_in"] = True
-            flash("Đăng nhập thành công. Chào mừng Admin Văn Linh đến vũ trụ giám sát API.", "ok")
-            return redirect(url_for("dashboard"))
-        else:
-            flash("Sai mật khẩu.", "error")
-    return render_template_string(LOGIN_TEMPLATE, title=APP_TITLE)
-
-@app.route("/logout")
-def logout():
-    session.clear() # Đã sửa lỗi: session.clear
-    flash("Đã đăng xuất.", "ok")
-    return redirect(url_for("login"))
-
-@app.route("/")
-def dashboard():
-    start_watcher_once()
-    settings_raw = get_settings()
-    bots = get_bots()
-    apis_raw = get_apis()
-
-    class SettingsObj:
-        def __init__(self, d):
-            self.default_chat_id = d.get("default_chat_id", "")
-            self.default_bot_id = int(d["default_bot_id"]) if d.get("default_bot_id", "").isdigit() else None
-            self.last_run = d.get("last_run", "") or ""
-            self.poll_interval = d.get("poll_interval", "")
-            self.global_threshold = d.get("global_threshold", "")
-
-    settings = SettingsObj(settings_raw)
-
-    # Lần chạy gần nhất (giờ VN)
-    last_run_iso = settings_raw.get("last_run", "") or ""
-    dt_last = parse_iso_utc(last_run_iso)
-    last_run_vn = fmt_time_label_vn(dt_last) if dt_last else ""
-
-    # Chuẩn bị apis + thời gian VN
-    apis = []
-    for a in apis_raw:
-        a2 = dict(a)
-        dt_chg = parse_iso_utc(a2.get("last_change") or "")
-        a2["last_change_vn"] = fmt_time_label_vn(dt_chg) if dt_chg else "-"
-        apis.append(a2)
-
-    # poll interval hiệu lực hiển thị
-    effective_poll_interval = to_float(settings.poll_interval or "", None)
-    if effective_poll_interval is None or effective_poll_interval < 5:
-        effective_poll_interval = POLL_INTERVAL_DEFAULT
-
-    global_threshold = to_float(settings.global_threshold or "", None)
-
-    return render_template_string(
-        DASHBOARD_TEMPLATE,
-        title=APP_TITLE,
-        bots=bots,
-        apis=apis,
-        settings=settings,
-        poll_interval=POLL_INTERVAL_DEFAULT,
-        watcher_running=watcher_running,
-        last_run_vn=last_run_vn,
-        effective_poll_interval=int(effective_poll_interval),
-        global_threshold=global_threshold,
-    )
-
-@app.route("/save_settings", methods=["POST"])
-def save_settings():
-    default_chat_id = (request.form.get("default_chat_id") or "").strip()
-    default_bot_id = (request.form.get("default_bot_id") or "").strip()
-    poll_interval = (request.form.get("poll_interval") or "").strip()
-    global_threshold = (request.form.get("global_threshold") or "").strip()
-
-    if poll_interval:
+# --- THREAD 2: PING SERVICE (ANTI-SLEEP) ---
+def ping_loop():
+    """
+    Luồng chạy ngầm gửi request đến chính URL của web hoặc URL chỉ định
+    để ngăn chặn các dịch vụ Free (như Render) cho ứng dụng vào chế độ ngủ đông.
+    """
+    print("INFO: Ping Service (Anti-Sleep) đã bắt đầu.")
+    while True:
         try:
-            pi = int(float(poll_interval))
-            if pi < 5:
-                flash("Chu kỳ quét tối thiểu là 5 giây.", "error")
-                return redirect(url_for("dashboard"))
-        except Exception:
-            flash("Chu kỳ quét không hợp lệ.", "error")
-            return redirect(url_for("dashboard"))
+            target_url = ""
+            interval = 300 # Mặc định 5 phút (300s)
+            
+            with db() as con:
+                r1 = con.execute("SELECT value FROM config WHERE key='ping_url'").fetchone()
+                r2 = con.execute("SELECT value FROM config WHERE key='ping_interval'").fetchone()
+                if r1: target_url = r1['value']
+                if r2: interval = int(r2['value'])
+            
+            if target_url and target_url.startswith("http"):
+                try:
+                    # Gửi request GET timeout ngắn
+                    requests.get(target_url, timeout=10)
+                    # print(f"PING SUCCESS: {target_url}")
+                except Exception as e:
+                    print(f"PING ERROR: Không thể ping đến {target_url}. Lỗi: {e}")
+            
+            if interval < 10: interval = 10 # Giới hạn tối thiểu 10s
+            time.sleep(interval)
+        except Exception as e:
+            print(f"Ping Loop Error: {e}")
+            time.sleep(60)
 
-    set_setting("default_chat_id", default_chat_id)
-    set_setting("default_bot_id", default_bot_id)
-    set_setting("poll_interval", poll_interval)
-    set_setting("global_threshold", global_threshold)
+def start_ping_service():
+    global ping_service_started
+    if not ping_service_started:
+        ping_service_started = True
+        t = threading.Thread(target=ping_loop, daemon=True)
+        t.start()
 
-    flash("Đã lưu cấu hình hệ thống.", "ok")
-    return redirect(url_for("dashboard"))
-
-@app.route("/add_bot", methods=["POST"])
-def add_bot():
-    name = (request.form.get("bot_name") or "").strip()
-    token = (request.form.get("bot_token") or "").strip()
-    if not name or not token:
-        flash("Thiếu tên hoặc token bot.", "error")
-        return redirect(url_for("dashboard"))
+# --- THREAD 3: AUTO BACKUP (TỰ ĐỘNG SAO LƯU) ---
+def perform_backup_to_file():
+    """
+    Hàm thực hiện sao lưu toàn bộ dữ liệu Database ra file JSON.
+    """
     try:
-        add_bot_db(name, token)
-        flash("Đã thêm bot mới.", "ok")
-    except sqlite3.IntegrityError:
-        flash("Token bot này đã tồn tại.", "error")
+        with db_lock:
+            with db() as con:
+                # Lấy toàn bộ dữ liệu từ các bảng
+                keymaps = [dict(row) for row in con.execute("SELECT * FROM keymaps").fetchall()]
+                config = {row['key']: row['value'] for row in con.execute("SELECT key, value FROM config").fetchall()}
+                proxies = [dict(row) for row in con.execute("SELECT * FROM proxies").fetchall()]
+                local_stock = [dict(row) for row in con.execute("SELECT * FROM local_stock").fetchall()]
+
+        backup_data = {
+            "keymaps": keymaps,
+            "config": config,
+            "proxies": proxies,
+            "local_stock": local_stock,
+            "generated_at": get_vn_time()
+        }
+        
+        # Ghi ra file JSON
+        with open(AUTO_BACKUP_FILE, 'w', encoding='utf-8') as f:
+            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+            
     except Exception as e:
-        flash(f"Lỗi khi thêm bot: {e}", "error")
-    return redirect(url_for("dashboard"))
+        print(f"AUTO BACKUP ERROR: {e}")
 
-@app.route("/delete_bot", methods=["POST"])
-def delete_bot():
-    try:
-        bot_id = int(request.form.get("bot_id") or "0")
-    except ValueError:
-        flash("ID bot không hợp lệ.", "error")
-        return redirect(url_for("dashboard"))
+def auto_backup_loop():
+    print("INFO: Auto Backup Service đã bắt đầu (Chu kỳ: 60 phút).")
+    while True:
+        time.sleep(3600) # 60 phút = 3600 giây
+        perform_backup_to_file()
 
-    delete_bot_db(bot_id)
+def start_auto_backup():
+    global auto_backup_started
+    if not auto_backup_started:
+        auto_backup_started = True
+        t = threading.Thread(target=auto_backup_loop, daemon=True)
+        t.start()
 
-    settings = get_settings()
-    if settings.get("default_bot_id") == str(bot_id):
-        set_setting("default_bot_id", "")
 
-    flash("Đã xoá bot.", "ok")
-    return redirect(url_for("dashboard"))
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 6: LOGIC XỬ LÝ KHO HÀNG & GỌI API (STOCK LOGIC)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
 
-@app.route("/test_bot", methods=["POST"])
-def test_bot():
-    try:
-        bot_id = int(request.form.get("bot_id") or "0")
-    except ValueError:
-        flash("ID bot không hợp lệ.", "error")
-        return redirect(url_for("dashboard"))
+# --- 1. XỬ LÝ LOCAL STOCK (KHO THỦ CÔNG) ---
+def get_local_stock_count(group_name):
+    """
+    Đếm số lượng hàng tồn kho trong bảng Local Stock theo tên Group.
+    """
+    with db() as con:
+        count = con.execute("SELECT COUNT(*) FROM local_stock WHERE group_name=?", (group_name,)).fetchone()[0]
+    return count
 
-    bots = get_bots()
-    bot = next((b for b in bots if b["id"] == bot_id), None)
-    if not bot:
-        flash("Không tìm thấy bot.", "error")
-        return redirect(url_for("dashboard"))
+def fetch_local_stock(group_name, qty):
+    """
+    Lấy hàng từ Local Stock theo số lượng yêu cầu.
+    QUAN TRỌNG: Hàng sau khi lấy sẽ bị XÓA VĨNH VIỄN khỏi Database để tránh bán trùng.
+    """
+    products = []
+    with db_lock:
+        with db() as con:
+            # Lấy N dòng đầu tiên
+            rows = con.execute("SELECT id, content FROM local_stock WHERE group_name=? LIMIT ?", (group_name, qty)).fetchall()
+            if not rows: return []
+            
+            ids_to_delete = [r['id'] for r in rows]
+            
+            # Xóa ngay lập tức các dòng đã lấy
+            con.execute(f"DELETE FROM local_stock WHERE id IN ({','.join(['?']*len(ids_to_delete))})", ids_to_delete)
+            con.commit()
+            
+            for r in rows:
+                products.append({"product": r['content']})
+    return products
 
-    settings = get_settings()
-    chat_id = (settings.get("default_chat_id") or "").strip()
-    if not chat_id:
-        flash("Chưa cấu hình TELEGRAM_CHAT_ID.", "error")
-        return redirect(url_for("dashboard"))
+# --- 2. XỬ LÝ API MAIL72H (VÀ CÁC API TƯƠNG TỰ) ---
+def _mail72h_collect_all_products(obj):
+    """Helper để parse JSON trả về từ API Mail72h"""
+    all_products = []
+    if not isinstance(obj, dict): return None
+    categories = obj.get('categories')
+    if not isinstance(categories, list): return None
+    for category in categories:
+        if isinstance(category, dict):
+            products_in_category = category.get('products')
+            if isinstance(products_in_category, list):
+                all_products.extend(products_in_category)
+    return all_products
 
-    send_telegram([bot["bot_token"]], chat_id,
-                  "✅ <b>Test thành công</b>\nBot đã kết nối và sẵn sàng gửi cảnh báo biến động số dư.")
-    flash("Đã gửi test message đến Telegram.", "ok")
-    return redirect(url_for("dashboard"))
+def mail72h_format_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
+    """Gửi request mua hàng đến API đối tác"""
+    data = {"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}
+    url = f"{base_url.rstrip('/')}/api/buy_product"
+    # Sử dụng Proxy hiện tại đang active
+    r = requests.post(url, data=data, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET) 
+    r.raise_for_status()
+    return r.json()
 
-@app.route("/add_api", methods=["POST"])
-def add_api():
-    name = (request.form.get("name") or "").strip()
-    url = (request.form.get("url") or "").strip()
-    balance_field = (request.form.get("balance_field") or "").strip()
-    if not name or not url:
-        flash("Thiếu tên hoặc URL API.", "error")
-        return redirect(url_for("dashboard"))
-    add_api_db(name, url, balance_field)
-    flash(f"Đã thêm API [{name}].", "ok")
-    return redirect(url_for("dashboard"))
+def mail72h_format_product_list(base_url: str, api_key: str) -> dict:
+    """Gửi request lấy danh sách sản phẩm (để check tồn kho)"""
+    params = {"api_key": api_key}
+    url = f"{base_url.rstrip('/')}/api/products.php"
+    # Sử dụng Proxy hiện tại đang active
+    r = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET)
+    r.raise_for_status()
+    return r.json()
 
-@app.route("/delete_api/<int:api_id>", methods=["POST"])
-def delete_api(api_id: int):
-    delete_api_db(api_id)
-    flash(f"Đã xoá API ID {api_id}.", "ok")
-    return redirect(url_for("dashboard"))
+def stock_mail72h_format(row):
+    """Logic kiểm tra tồn kho cho API Mail72h"""
+    for retry_count in range(2): 
+        try:
+            base_url = row['base_url'] 
+            pid_to_find_str = str(row["product_id"])
+            list_data = mail72h_format_product_list(base_url, row["api_key"])
+            
+            if list_data.get("status") != "success":
+                return jsonify({"sum": 0}), 200
 
-# =========================
-# BACKUP & RESTORE (JSON)
-# =========================
-@app.route("/download_backup")
-def download_backup():
-    import json
-    data = {
-        "settings": get_settings(),
-        "bots": get_bots(),
-        "apis": get_apis(),
-        "generated_at_utc": datetime.utcnow().isoformat() + "Z",
-        "schema_version": 1,
+            products = _mail72h_collect_all_products(list_data)
+            if not products: return jsonify({"sum": 0}), 200
+
+            stock_val = 0
+            for item in products:
+                # Parse ID an toàn
+                try:
+                    item_id_str = str(int(float(str(item.get("id", 0)))))
+                except:
+                    continue
+                    
+                if item_id_str == pid_to_find_str:
+                    stock_val = int(item.get("amount", 0))
+                    break
+            
+            return jsonify({"sum": stock_val})
+        
+        except requests.exceptions.ProxyError:
+            print("STOCK: Proxy lỗi. Đang thử đổi proxy khác...")
+            switch_to_next_live_proxy()
+            continue
+        except Exception as e:
+            print(f"STOCK ERROR: {e}")
+            return jsonify({"sum": 0}), 200
+            
+    return jsonify({"sum": 0}), 200
+
+def fetch_mail72h_format(row, qty):
+    """Logic mua hàng cho API Mail72h"""
+    for retry_count in range(2): 
+        try:
+            base_url = row['base_url']
+            res = mail72h_format_buy(base_url, row["api_key"], int(row["product_id"]), qty)
+            
+            if res.get("status") != "success":
+                return jsonify([]), 200
+
+            data = res.get("data")
+            out = []
+            if isinstance(data, list):
+                for it in data:
+                    val = json.dumps(it, ensure_ascii=False) if isinstance(it, dict) else str(it)
+                    out.append({"product": val})
+            else:
+                val = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
+                out = [{"product": val} for _ in range(qty)]
+            
+            return jsonify(out)
+            
+        except requests.exceptions.ProxyError:
+            print("FETCH: Proxy lỗi. Đang thử đổi proxy khác...")
+            switch_to_next_live_proxy()
+            continue
+        except Exception as e:
+            print(f"FETCH ERROR: {e}")
+            return jsonify([]), 200
+            
+    return jsonify([]), 200
+
+
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 7: HTML TEMPLATES (GIAO DIỆN CHI TIẾT - BUNG CODE)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 7.1. TEMPLATE ĐĂNG NHẬP (LOGIN)
+# ------------------------------------------------------------------------------
+LOGIN_TPL = """
+<!doctype html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <title>Đăng Nhập Quản Trị - Quantum Gate</title>
+    <style>
+        :root { 
+            --primary: #5a7dff;
+            --red: #f07167; 
+            --bg-light: #121212;
+            --border: #343a40;
+            --card-bg: #1c1c1e;
+            --text-dark: #e9ecef;
+            --text-light: #adb5bd;
+            --input-bg: #2c2c2e;
+            --shadow: 0 4px 12px rgba(0,0,0,0.4);
+            --space-gradient-start: #0a0a1a;
+            --space-gradient-end: #20204a;
+            --star-color: #e0e0e0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text-dark);
+            background: linear-gradient(135deg, var(--space-gradient-start) 0%, var(--space-gradient-end) 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin: 0;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .login-container {
+            width: 100%;
+            max-width: 400px;
+            padding: 40px 30px;
+            border-radius: 12px;
+            background: var(--card-bg);
+            box-shadow: var(--shadow);
+            position: relative;
+            z-index: 10;
+            text-align: left; 
+        }
+        
+        .header-info {
+            display: flex;
+            align-items: center;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+        
+        .logo {
+            width: 40px;
+            height: 40px;
+            background: linear-gradient(45deg, #3a86ff, #5a7dff);
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 20px;
+            color: white;
+            margin-right: 15px;
+            font-family: monospace;
+            font-weight: bold;
+            box-shadow: 0 0 10px rgba(90, 125, 255, 0.5);
+        }
+        
+        .title-group {
+            flex-grow: 1;
+            line-height: 1.3;
+        }
+        
+        .title-group p {
+            margin: 0;
+            font-size: 14px;
+            color: var(--text-light);
+        }
+        
+        h1 {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--text-dark);
+            margin: 0 0 10px 0;
+        }
+        
+        .subtitle {
+            font-size: 14px;
+            color: var(--text-light);
+            margin-bottom: 25px;
+        }
+        
+        label {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-dark);
+            margin-bottom: 10px;
+            display: block;
+            text-align: left;
+        }
+        
+        input {
+            width: 100%;
+            padding: 14px 16px;
+            margin-bottom: 30px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            box-sizing: border-box;
+            background: var(--input-bg);
+            color: var(--text-dark);
+            transition: border-color .2s, box-shadow .2s;
+            font-size: 16px;
+        }
+        
+        input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(90, 125, 255, 0.25);
+            outline: none;
+        }
+        
+        button {
+            width: 100%;
+            padding: 15px 16px;
+            border-radius: 10px;
+            border: none;
+            background: linear-gradient(90deg, #3a86ff, #5a7dff);
+            color: #fff;
+            cursor: pointer;
+            font-weight: 700;
+            font-size: 16px;
+            box-shadow: 0 4px 15px rgba(90, 125, 255, 0.4);
+            transition: opacity .2s, transform .1s;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        button:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+        
+        .flash-alert {
+            padding: 12px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            font-weight: 600;
+            background-color: #f8d7da;
+            border-color: #f5c2c7;
+            color: #842029;
+        }
+        
+        #space-background {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            overflow: hidden;
+            z-index: 0;
+        }
+        
+        .star {
+            position: absolute;
+            background-color: var(--star-color);
+            border-radius: 50%;
+            opacity: 0;
+            animation: twinkle 5s infinite ease-in-out;
+            z-index: 0;
+        }
+        
+        @keyframes twinkle {
+            0%, 100% { opacity: 0; transform: scale(0.5); }
+            50% { opacity: 1; transform: scale(1.2); }
+        }
+    </style>
+</head>
+<body>
+<div id="space-background"></div>
+<div class="login-container">
+    <div class="header-info">
+        <div class="logo">∞</div>
+        <div class="title-group">
+            <p style="font-size: 16px; font-weight: 600; color: var(--text-dark);">QUANTUM SECURITY GATE</p>
+        </div>
+    </div>
+
+    <h1>Đăng nhập</h1>
+    <p class="subtitle">Nhập mật khẩu quản trị để truy cập DashBoard.</p>
+    
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="flash-alert {{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+    
+    <form method="post" action="{{ url_for('login') }}">
+        <label for="admin_secret">Mật khẩu Admin</label>
+        <input type="password" id="admin_secret" name="admin_secret" placeholder="Nhập mật khẩu..." required autofocus>
+        <button type="submit">
+            🚀 
+            <span style="margin-left: 8px;">Truy Cập</span>
+        </button>
+    </form>
+</div>
+
+<script>
+(function() {
+    const spaceBackground = document.getElementById('space-background');
+    const numStars = 100;
+    for (let i = 0; i < numStars; i++) {
+        let star = document.createElement('div');
+        star.className = 'star';
+        star.style.width = star.style.height = `${Math.random() * 3 + 1}px`;
+        star.style.left = `${Math.random() * 100}%`;
+        star.style.top = `${Math.random() * 100}%`;
+        star.style.animationDelay = `${Math.random() * 5}s`;
+        spaceBackground.appendChild(star);
     }
-    backup_json = json.dumps(data, ensure_ascii=False, indent=2)
-    return Response(
-        backup_json,
-        mimetype="application/json",
-        headers={"Content-Disposition": 'attachment; filename="balance_watcher_backup.json"'},
-    )
+})();
+</script>
+</body>
+</html>
+"""
 
-@app.route("/download_settings")
-def download_settings():
-    import json
-    backup_json = json.dumps(get_settings(), ensure_ascii=False, indent=2)
-    return Response(
-        backup_json,
-        mimetype="application/json",
-        headers={"Content-Disposition": 'attachment; filename="settings.json"'},
-    )
+# ------------------------------------------------------------------------------
+# 7.2 TEMPLATE DASHBOARD QUẢN TRỊ (ADMIN_TPL)
+# ------------------------------------------------------------------------------
+ADMIN_TPL = """
+<!doctype html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <title>Multi-Provider Admin Dashboard</title>
+    <style>
+    /* --- CẤU HÌNH MÀU SẮC & BIẾN TOÀN CỤC --- */
+    :root { 
+        --primary: #5a7dff; 
+        --green: #20c997; 
+        --red: #f07167; 
+        --blue: #3a86ff;
+        --gray: #adb5bd;
+        --shadow: 0 4px 12px rgba(0,0,0,0.2);
 
-@app.route("/download_bots")
-def download_bots():
-    import json
-    backup_json = json.dumps(get_bots(), ensure_ascii=False, indent=2)
-    return Response(
-        backup_json,
-        mimetype="application/json",
-        headers={"Content-Disposition": 'attachment; filename="bots.json"'},
-    )
+        /* Dark Mode Variables */
+        --bg-light: #121212;
+        --border: #343a40;
+        --card-bg: #1c1c1e;
+        --text-dark: #e9ecef;
+        --text-light: #adb5bd;
+        --input-bg: #2c2c2e;
+        --disabled-bg: #343a40;
+        --disabled-text: #6c757d;
+        --code-bg: #343a40;
+        --nested-summary-bg: #2c2c2e;
+        
+        /* Space Theme Colors */
+        --space-gradient-start: #0a0a1a;
+        --space-gradient-end: #20204a;
+        --star-color: #e0e0e0;
+    }
 
-@app.route("/download_apis")
-def download_apis():
-    import json
-    backup_json = json.dumps(get_apis(), ensure_ascii=False, indent=2)
-    return Response(
-        backup_json,
-        mimetype="application/json",
-        headers={"Content-Disposition": 'attachment; filename="apis.json"'},
-    )
+    /* Light Mode Variables */
+    :root[data-theme="light"] {
+        --primary: #0d6efd; 
+        --green: #198754; 
+        --red: #dc3545; 
+        --blue: #0d6efd;
+        --gray: #6c757d;
+        --shadow: 0 4px 12px rgba(0,0,0,0.05);
+        
+        --bg-light: #f8f9fa; 
+        --border: #dee2e6;
+        --card-bg: #ffffff;
+        --text-dark: #212529;
+        --text-light: #495057;
+        --input-bg: #ffffff;
+        --disabled-bg: #e9ecef;
+        --disabled-text: #6c757d;
+        --code-bg: #e9ecef;
+        --nested-summary-bg: #f0f0f0;
 
-@app.route("/restore_backup", methods=["POST"])
-def restore_backup():
-    """
-    Nhận file JSON, phục hồi:
-      - Nếu tick "wipe": xoá hết telegram_bots, apis
-      - Cập nhật settings theo keys (không đụng ADMIN_PASSWORD/SECRET_KEY vì là ENV)
-      - Thêm lại bots, apis; nhận last_balance/last_change nếu có
-    """
-    file = request.files.get("backup_file")
-    if not file or not file.filename.lower().endswith(".json"):
-        flash("Vui lòng chọn file .json hợp lệ.", "error")
-        return redirect(url_for("dashboard"))
+        --space-gradient-start: #ffffff;
+        --space-gradient-end: #f0f0f0;
+        --star-color: #888888;
+    }
 
-    import json
+    /* --- BASE STYLES --- */
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        padding: 28px;
+        color: var(--text-dark);
+        background: linear-gradient(135deg, var(--space-gradient-start) 0%, var(--space-gradient-end) 100%);
+        line-height: 1.6;
+        transition: background-color 0.3s, color 0.3s;
+        position: relative;
+        overflow-x: hidden;
+        min-height: 100vh;
+        margin: 0;
+    }
+
+    /* --- CARD COMPONENT --- */
+    .card {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 24px;
+        margin-bottom: 24px;
+        background: var(--card-bg);
+        box-shadow: var(--shadow);
+        transition: transform 0.2s, box-shadow 0.2s;
+        position: relative;
+        z-index: 10;
+    }
+
+    /* --- GRID SYSTEM --- */
+    .row {
+        display: grid;
+        grid-template-columns: repeat(12, 1fr);
+        gap: 16px;
+        align-items: end;
+    }
+    .col-1 { grid-column: span 1; }
+    .col-2 { grid-column: span 2; }
+    .col-3 { grid-column: span 3; }
+    .col-4 { grid-column: span 4; }
+    .col-6 { grid-column: span 6; }
+    .col-8 { grid-column: span 8; }
+    .col-12 { grid-column: span 12; }
+
+    /* --- FORM ELEMENTS --- */
+    label {
+        font-size: 12px;
+        font-weight: 700;
+        text-transform: uppercase;
+        color: var(--text-light);
+        margin-bottom: 6px;
+        display: block;
+    }
+    
+    input, select, textarea {
+        width: 100%;
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        box-sizing: border-box;
+        background: var(--input-bg);
+        color: var(--text-dark);
+        font-size: 14px;
+        transition: border-color 0.2s, box-shadow 0.2s;
+        font-family: monospace; /* Giúp căn chỉnh input key */
+    }
+    
+    input:focus, select:focus, textarea:focus {
+        border-color: var(--primary);
+        outline: none;
+        box-shadow: 0 0 0 3px rgba(90, 125, 255, 0.25);
+    }
+
+    /* --- BUTTONS --- */
+    button, .btn {
+        padding: 10px 20px;
+        border-radius: 8px;
+        border: none;
+        background: var(--primary);
+        color: #fff;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 14px;
+        text-decoration: none;
+        display: inline-block;
+        text-align: center;
+        transition: filter 0.2s, transform 0.1s;
+    }
+    
+    button:hover, .btn:hover {
+        filter: brightness(1.1);
+        transform: translateY(-1px);
+    }
+    
+    .btn.red { background: var(--red); }
+    .btn.green { background: var(--green); }
+    .btn.blue { background: var(--blue); }
+    .btn.gray { background: var(--gray); }
+    .btn.small { padding: 6px 12px; font-size: 12px; }
+
+    /* --- TABLES (DÙNG CHO LOCAL STOCK & PROXY) --- */
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 15px;
+        font-size: 13px;
+    }
+    
+    th, td {
+        padding: 12px 15px;
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+        word-break: break-all;
+        vertical-align: middle;
+    }
+    
+    th {
+        font-size: 12px;
+        text-transform: uppercase;
+        color: var(--text-light);
+        letter-spacing: 0.5px;
+    }
+    
+    /* --- NESTED DETAILS / SUMMARY (DÙNG CHO DANH SÁCH KEY) --- */
+    
+    /* Cấp 1: Website Folder */
+    details.folder {
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        margin-bottom: 15px;
+        overflow: hidden;
+    }
+    
+    details.folder > summary { 
+        padding: 15px 20px; 
+        cursor: pointer; 
+        font-weight: 700; 
+        font-size: 16px;
+        background: var(--card-bg); 
+        color: var(--primary);
+        list-style: none; 
+    }
+    
+    details.folder > summary::-webkit-details-marker {
+        display: inline-block;
+    }
+    
+    details.folder > .content { 
+        padding: 20px; 
+        background: var(--bg-light); 
+        border-top: 1px solid var(--border); 
+    }
+
+    /* Cấp 2: Provider Box */
+    details.provider {
+        margin-top: 15px;
+        margin-bottom: 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+    }
+    
+    details.provider > summary {
+        padding: 12px 15px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 14px;
+        background: #2a2a2d;
+        color: #fff;
+    }
+    
+    details.provider > .content {
+        padding: 0;
+        background: transparent;
+    }
+
+    /* Cấp 3: Bảng Key Chi Tiết */
+    .provider-table {
+        width: 100%;
+        border-collapse: collapse;
+    }
+    
+    .provider-table th {
+        background: #1f1f22;
+        font-size: 11px;
+        color: #aaa;
+        padding: 10px 15px;
+        border-bottom: 1px solid #333;
+    }
+    
+    .provider-table td {
+        border-bottom: 1px solid #333;
+        padding: 10px 15px;
+        font-size: 13px;
+        color: #e0e0e0;
+    }
+    
+    .provider-table tr:last-child td {
+        border-bottom: none;
+    }
+    
+    /* --- UTILS --- */
+    h2 {
+        font-size: 28px;
+        font-weight: 700;
+        color: var(--primary);
+        border-bottom: 2px solid var(--border);
+        padding-bottom: 15px;
+        margin-bottom: 25px;
+    }
+    
+    h3 { margin: 0 0 20px 0; font-size: 22px; color: var(--text-dark); }
+    h4 { margin: 0 0 10px 0; font-size: 18px; color: var(--text-dark); }
+    
+    code {
+        background: var(--code-bg);
+        color: var(--primary);
+        padding: 4px 8px;
+        border-radius: 6px;
+        font-family: monospace;
+        font-size: 0.9em;
+    }
+    
+    /* --- BADGES (FIX GIAO DIỆN INPUT KEY 1 DÒNG) --- */
+    .badge-key {
+        display: inline-block;
+        background: rgba(58, 134, 255, 0.15); /* Màu nền xanh nhạt */
+        color: #5a7dff;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-family: monospace;
+        font-weight: bold;
+        border: 1px solid rgba(58, 134, 255, 0.3);
+        white-space: nowrap; /* QUAN TRỌNG: Giữ key trên 1 dòng */
+    }
+    
+    .badge-url {
+        background: #343a40;
+        color: #adb5bd;
+        padding: 3px 6px;
+        border-radius: 4px;
+        font-family: monospace;
+        font-size: 12px;
+    }
+    
+    /* --- FLASH MESSAGES --- */
+    .flash-alert {
+        padding: 16px;
+        margin-bottom: 20px;
+        border-radius: 10px;
+        font-weight: 600;
+        border: 1px solid transparent;
+    }
+    
+    .flash-alert.success {
+        background-color: #d1e7dd;
+        border-color: #badbcc;
+        color: #0f5132;
+    }
+    
+    .flash-alert.error {
+        background-color: #f8d7da;
+        border-color: #f5c2c7;
+        color: #842029;
+    }
+
+    /* --- ANIMATIONS & EFFECTS --- */
+    .space-background {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        overflow: hidden;
+        z-index: 0; 
+    }
+    
+    .star {
+        position: absolute;
+        background-color: var(--star-color);
+        border-radius: 50%;
+        opacity: 0;
+        animation: twinkle 5s infinite ease-in-out;
+    }
+    
+    .astronaut {
+        position: absolute;
+        width: 120px;
+        height: 120px;
+        background-image: url('https://freepng.flyclipart.com/thumb/cat-astronaut-space-suit-moon-outer-space-png-sticker-31913.png');
+        background-size: contain;
+        background-repeat: no-repeat;
+        animation: floatAstronaut 25s infinite ease-in-out;
+        z-index: 1; 
+        opacity: 0.8;
+        pointer-events: none;
+    }
+    
+    .effect-canvas {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100vw;
+        height: 100vh;
+        pointer-events: none;
+        z-index: 0; 
+    }
+    
+    @keyframes twinkle {
+        0%, 100% { opacity: 0; transform: scale(0.5); }
+        50% { opacity: 1; transform: scale(1.2); }
+    }
+    
+    @keyframes floatAstronaut {
+        0% { transform: translate(0, 0) rotate(0deg); }
+        50% { transform: translate(50px, -30px) rotate(10deg); }
+        100% { transform: translate(0, 0) rotate(0deg); }
+    }
+    
+    .status-live { color: var(--green); font-weight: bold; }
+    .status-dead { color: var(--red); font-weight: bold; }
+    .mono { font-family: monospace; }
+    </style>
+    
+    <script>
+    // Tự động set theme ngay khi load trang
+    (function() {
+        var mode = document.cookie.split('; ').find(row => row.startsWith('admin_mode='))?.split('=')[1] || 'dark';
+        document.documentElement.setAttribute('data-theme', mode);
+    })();
+    </script>
+</head>
+<body>
+
+{% if effect == 'astronaut' %}
+<div class="space-background" id="space-background"></div>
+{% endif %}
+
+<div id="main-content" style="position: relative; z-index: 10;"> 
+  
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+      {% for category, message in messages %}
+        <div class="flash-alert {{ category }}">{{ message }}</div>
+      {% endfor %}
+    {% endif %}
+  {% endwith %}
+  
+  <h2>⚙️ Multi-Provider Admin Dashboard</h2>
+  
+  <div class="card" id="add-key-form-card">
+    <h3>1. Thêm Key & Cấu Hình</h3>
+    <form method="post" action="{{ url_for('admin_add_keymap') }}" id="main-key-form">
+      <div class="row" style="margin-bottom: 20px;">
+        <div class="col-4">
+          <label>Group Name (Nhóm Website)</label>
+          <input class="mono" name="group_name" placeholder="VD: Netflix, Spotify...">
+        </div>
+        <div class="col-4">
+          <label>Provider Type (Loại)</label>
+          <input class="mono" name="provider_type" placeholder="mail72h / local" required>
+        </div>
+        <div class="col-4">
+          <label>Base URL (Nếu dùng API)</label>
+          <input class="mono" name="base_url" placeholder="https://api.website.com">
+        </div>
+      </div>
+      
+      <div class="row">
+         <div class="col-2"><label>SKU</label><input class="mono" name="sku" required></div>
+         <div class="col-3"><label>Input Key (Mã bán)</label><input class="mono" name="input_key" required></div>
+         <div class="col-2"><label>Product ID</label><input class="mono" name="product_id" placeholder="ID..." required></div>
+         <div class="col-3"><label>API Key (Nếu có)</label><input class="mono" name="api_key" type="password"></div>
+         <div class="col-2">
+            <button type="submit" style="width: 100%; height: 42px; margin-top: 20px;">Lưu Key</button>
+         </div>
+      </div>
+      
+      <p style="font-size: 12px; color: var(--text-light); margin-top: 8px;">
+        * <b>Lưu ý:</b> Nếu chọn Type là <b>local</b>, hệ thống sẽ lấy hàng từ "Kho Hàng Thủ Công" (Mục 4) dựa theo tên Group Name.
+      </p>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>2. Danh Sách Keymaps (Theo Website)</h3>
+    
+    {% if not grouped_data %}
+        <p style="text-align: center; color: var(--text-light); padding: 20px;">Chưa có key nào được thêm.</p>
+    {% endif %}
+
+    {% for folder, providers in grouped_data.items() %}
+      <details class="folder" open>
+        <summary>📁 Website: {{ folder }}</summary>
+        <div class="content">
+          
+          {% for provider, keys in providers.items() %}
+            <details class="provider">
+              <summary>📦 Provider: {{ provider }} ({{ keys|length }} keys)</summary>
+              <div class="content">
+                
+                <table class="provider-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 25%;">SKU</th>
+                      <th style="width: 25%;">INPUT KEY</th>
+                      <th style="width: 20%;">BASE URL</th>
+                      <th style="width: 5%;">ID</th>
+                      <th style="width: 5%;">ACTIVE</th>
+                      <th style="width: 20%;">HÀNH ĐỘNG</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                  {% for k in keys %}
+                    <tr>
+                      <td>{{ k.sku }}</td>
+                      <td><span class="badge-key">{{ k.input_key }}</span></td>
+                      <td><span class="badge-url">{{ k.base_url }}</span></td>
+                      <td>{{ k.product_id }}</td> 
+                      <td>
+                        {% if k.is_active %}
+                            <span style="color: var(--green);">✅</span>
+                        {% else %}
+                            <span style="color: var(--red);">❌</span>
+                        {% endif %}
+                      </td>
+                      <td> 
+                        <div style="display: flex; gap: 5px;">
+                            <button class="btn gray small edit-btn" 
+                                    data-group="{{ k.group_name }}"
+                                    data-provider="{{ k.provider_type }}"
+                                    data-url="{{ k.base_url }}"
+                                    data-sku="{{ k.sku }}"
+                                    data-key="{{ k.input_key }}"
+                                    data-pid="{{ k.product_id }}"
+                                    type="button">Sửa ✏️</button>
+                            
+                            <form method="post" action="{{ url_for('admin_toggle_key', kmid=k.id) }}" style="margin:0;">
+                                <button class="btn blue small" type="submit">{{ 'Tắt' if k.is_active else 'Bật' }}</button>
+                            </form>
+                            <form method="post" action="{{ url_for('admin_delete_key', kmid=k.id) }}" onsubmit="return confirm('Xác nhận xóa key này?');" style="margin:0;">
+                                <button class="btn red small" type="submit">Xoá</button>
+                            </form>
+                        </div>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                  </tbody>
+                </table>
+                
+              </div>
+            </details>
+          {% endfor %}
+          
+        </div>
+      </details>
+    {% endfor %}
+  </div>
+
+  <div class="card">
+    <h3>3. Backup & Restore</h3>
+    <div class="row">
+      <div class="col-6">
+        <h4>Tải Backup (JSON)</h4>
+        <p style="color: var(--text-light); margin-bottom: 15px;">
+            Render sẽ xóa sạch dữ liệu khi Restart. Hãy tải file này thường xuyên và cập nhật vào <b>Secret File</b> trên Dashboard của Render.
+        </p>
+        <a href="{{ url_for('admin_backup_download') }}" class="btn green">⬇️ Tải Xuống Backup</a>
+      </div>
+      <div class="col-6" style="border-left: 1px solid var(--border); padding-left: 20px;">
+        <h4>Restore Thủ Công</h4>
+        <p style="color: var(--text-light); margin-bottom: 15px;">
+            Upload file JSON để khôi phục dữ liệu ngay lập tức. Hành động này sẽ <b>GHI ĐÈ</b> toàn bộ dữ liệu hiện tại.
+        </p>
+        <form method="post" action="{{ url_for('admin_backup_upload') }}" enctype="multipart/form-data" onsubmit="return confirm('CẢNH BÁO: Hành động này sẽ XÓA SẠCH dữ liệu hiện tại và thay thế bằng file backup. Tiếp tục?');">
+          <input type="file" name="backup_file" accept=".json" required style="margin-bottom: 10px;">
+          <button type="submit" class="btn red">⬆️ Upload & Restore</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col-6 card" id="local-stock">
+        <h3 style="color: var(--green);">📦 4. Kho Hàng Thủ Công (Local Stock)</h3>
+        
+        <form method="post" action="{{ url_for('admin_local_stock_add') }}" enctype="multipart/form-data">
+            <div style="margin-bottom: 15px;">
+                <label>Group Name (Phải trùng với Keymap đã tạo)</label>
+                <input class="mono" name="group_name" list="group_hints" required placeholder="VD: Netflix">
+                <datalist id="group_hints">
+                    {% for g in local_groups %}
+                        <option value="{{ g }}">
+                    {% endfor %}
+                </datalist>
+            </div>
+            
+            <div class="row">
+                <div class="col-6">
+                    <div style="border: 1px dashed var(--border); padding: 10px; border-radius: 6px;">
+                        <label style="color: var(--primary);">Cách 1: Upload File .txt</label>
+                        <input type="file" name="stock_file" accept=".txt" class="mono" style="margin-top: 5px;">
+                    </div>
+                </div>
+                <div class="col-6">
+                    <label>Cách 2: Dán Dữ Liệu (Mỗi dòng 1 acc)</label>
+                    <textarea class="mono" name="content" rows="3" placeholder="user|pass..."></textarea>
+                </div>
+            </div>
+            
+            <button type="submit" class="btn green" style="width: 100%; margin-top: 15px;">⬆️ Up Hàng Vào Kho</button>
+        </form>
+        
+        <h4 style="margin-top: 25px; border-bottom: 1px solid var(--border); padding-bottom: 5px;">Thống Kê Kho</h4>
+        <div style="max-height: 250px; overflow-y: auto;">
+            {% for g, c in local_stats.items() %}
+            <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed var(--border);">
+                <span>
+                    <b style="color: var(--primary);">{{ g }}</b>: 
+                    <span style="background: var(--input-bg); padding: 2px 6px; border-radius: 4px;">{{ c }} items</span>
+                </span>
+                <div>
+                    <a href="{{ url_for('admin_local_stock_view', group=g) }}" class="btn blue small">Xem</a>
+                    <form action="{{ url_for('admin_local_stock_clear') }}" method="post" style="display: inline;" onsubmit="return confirm('Bạn có chắc chắn muốn XÓA SẠCH kho {{g}} không?');">
+                        <input type="hidden" name="group_name" value="{{ g }}">
+                        <button class="btn red small">Xóa</button>
+                    </form>
+                </div>
+            </div>
+            {% else %}
+            <p style="text-align: center; color: var(--text-light); padding: 10px;">Kho đang trống.</p>
+            {% endfor %}
+        </div>
+    </div>
+
+    <div class="col-6 card">
+        <h3>5. Quản Lý Proxy & Ping</h3>
+        
+        <div style="margin-bottom: 15px;">
+            Proxy Đang Dùng: <code class="mono" style="color: var(--green); font-size: 1.1em;">{{ current_proxy or 'Direct Connection' }}</code>
+        </div>
+        
+        <form method="post" action="{{ url_for('admin_add_proxy') }}">
+            <label>Thêm Danh Sách Proxy (Mỗi dòng 1 cái: ip:port)</label>
+            <textarea class="mono" name="proxies" rows="4" placeholder="ip:port&#10;ip:port:user:pass"></textarea>
+            <button type="submit" class="btn green" style="margin-top: 10px; width: 100%;">➕ Thêm Proxy</button>
+        </form>
+        
+        <div style="margin-top: 20px; max-height: 200px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px;">
+            <table style="margin: 0;">
+                <thead><tr><th>Proxy</th><th>Status</th><th>Ping</th><th>Xóa</th></tr></thead>
+                <tbody>
+                {% for p in proxies %}
+                    <tr>
+                        <td class="mono" style="font-size: 11px;">{{ p.proxy_string }}</td>
+                        <td style="font-weight: bold; color: {{ 'var(--green)' if p.is_live else 'var(--red)' }};">
+                            {{ 'LIVE' if p.is_live else 'DIE' }}
+                        </td>
+                        <td>{{ "%.2f"|format(p.latency) }}s</td>
+                        <td>
+                            <form action="{{ url_for('admin_delete_proxy') }}" method="post">
+                                <input type="hidden" name="id" value="{{ p.id }}">
+                                <button class="btn red small" style="padding: 2px 6px;">x</button>
+                            </form>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        
+        <hr style="border-color: var(--border); margin: 25px 0;">
+        
+        <h4>🌐 Cấu Hình Ping (Anti-Sleep)</h4>
+        <p style="font-size: 0.9em; color: var(--text-light); margin-bottom: 10px;">
+            Giúp Website không bị ngủ đông trên Render Free Tier.
+        </p>
+        <form method="post" action="{{ url_for('admin_save_ping') }}">
+            <div class="row">
+                <div class="col-8">
+                    <input class="mono" name="ping_url" value="{{ ping.url }}" placeholder="https://myapp.onrender.com">
+                </div>
+                <div class="col-4">
+                    <button class="btn blue" style="width: 100%;">Lưu Cấu Hình</button>
+                </div>
+            </div>
+        </form>
+    </div>
+  </div>
+
+  <div class="card" style="padding: 20px;">
+    <div class="row" style="align-items: center;">
+      <div class="col-4">
+        <label>Giao diện</label>
+        <select id="mode-switcher" class="mono">
+          <option value="dark" {% if mode == 'dark' %}selected{% endif %}>Tối (Dark)</option>
+          <option value="light" {% if mode == 'light' %}selected{% endif %}>Sáng (Light)</option>
+        </select>
+      </div>
+      <div class="col-4">
+        <label>Hiệu ứng nền</label>
+        <select id="effect-switcher" class="mono">
+          <option value="default" {% if effect == 'default' %}selected{% endif %}>Tắt Hiệu Ứng</option>
+          <option value="astronaut" {% if effect == 'astronaut' %}selected{% endif %}>Phi hành gia (Astronaut)</option>
+          <option value="snow" {% if effect == 'snow' %}selected{% endif %}>Tuyết Rơi (Snow)</option>
+          <option value="matrix" {% if effect == 'matrix' %}selected{% endif %}>Ma Trận (Matrix)</option>
+          <option value="rain" {% if effect == 'rain' %}selected{% endif %}>Mưa Rơi (Rain)</option>
+          <option value="particles" {% if effect == 'particles' %}selected{% endif %}>Hạt Kết Nối (Particles)</option>
+          <option value="sakura" {% if effect == 'sakura' %}selected{% endif %}>Hoa Anh Đào (Sakura)</option>
+        </select>
+      </div>
+      <div class="col-4">
+        <label>&nbsp;</label>
+        <form method="post" action="{{ url_for('logout') }}">
+          <button class="btn red" type="submit" style="width: 100%;">Đăng Xuất Hệ Thống</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div style="text-align: center; color: var(--text-light); margin-top: 20px; font-size: 12px;">
+      Quantum Gate System &copy; 2024 | Developed for MMO Automation
+  </div>
+
+</div> 
+
+<script>
+// Xử lý chuyển đổi Theme/Effect
+document.getElementById('effect-switcher').addEventListener('change', function() {
+    document.cookie = `admin_effect=${this.value};path=/;max-age=31536000;SameSite=Lax`;
+    location.reload();
+});
+
+document.getElementById('mode-switcher').addEventListener('change', function() {
+    document.cookie = `admin_mode=${this.value};path=/;max-age=31536000;SameSite=Lax`;
+    location.reload();
+});
+
+// Script xử lý nút Sửa (Edit) - Điền dữ liệu lên form ở trên
+document.querySelectorAll('.edit-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        // Lấy dữ liệu từ attribute data-*
+        document.querySelector('input[name="group_name"]').value = btn.dataset.group;
+        document.querySelector('input[name="provider_type"]').value = btn.dataset.provider;
+        document.querySelector('input[name="base_url"]').value = btn.dataset.url;
+        document.querySelector('input[name="sku"]').value = btn.dataset.sku;
+        document.querySelector('input[name="input_key"]').value = btn.dataset.key;
+        document.querySelector('input[name="product_id"]').value = btn.dataset.pid;
+        
+        // Cuộn trang lên form thêm key
+        document.getElementById('add-key-form-card').scrollIntoView({behavior: 'smooth'});
+    });
+});
+
+// Hàm tạo Canvas chung cho các hiệu ứng
+function createEffectCanvas(id) {
+    if (document.getElementById(id)) return null; 
+    var canvas = document.createElement('canvas');
+    canvas.id = id;
+    canvas.className = 'effect-canvas'; 
+    document.body.appendChild(canvas);
+    
+    var ctx = canvas.getContext('2d');
+    var W = window.innerWidth;
+    var H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    
+    window.addEventListener('resize', function() {
+        W = window.innerWidth;
+        H = window.innerHeight;
+        canvas.width = W;
+        canvas.height = H;
+    });
+    
+    return { canvas, ctx, W, H };
+}
+</script>
+
+{% if effect == 'astronaut' %}
+<script>
+(function() {
+    const spaceBackground = document.getElementById('space-background');
+    if (!spaceBackground) return;
+
+    // Tạo sao
+    for (let i = 0; i < 100; i++) {
+        let star = document.createElement('div');
+        star.className = 'star';
+        star.style.width = star.style.height = `${Math.random() * 3 + 1}px`;
+        star.style.left = `${Math.random() * 100}%`;
+        star.style.top = `${Math.random() * 100}%`;
+        star.style.animationDelay = `${Math.random() * 5}s`;
+        spaceBackground.appendChild(star);
+    }
+    // Tạo phi hành gia
+    let astronaut = document.createElement('div');
+    astronaut.className = 'astronaut';
+    astronaut.style.left = '10%';
+    astronaut.style.top = '20%';
+    spaceBackground.appendChild(astronaut);
+})();
+</script>
+{% endif %}
+
+{% if effect == 'snow' %}
+<script>
+(function() {
+    var a = createEffectCanvas('snow-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    
+    var mp = 100; // Số lượng tuyết
+    var flakes = [];
+    for(var i = 0; i < mp; i++) {
+        flakes.push({
+            x: Math.random() * W, y: Math.random() * H,
+            r: Math.random() * 4 + 1, d: Math.random() * 100
+        });
+    }
+    
+    var angle = 0;
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
+        ctx.beginPath();
+        for(var i = 0; i < 100; i++) {
+            var f = flakes[i];
+            ctx.moveTo(f.x, f.y);
+            ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2, true);
+        }
+        ctx.fill();
+        update();
+        requestAnimationFrame(draw);
+    }
+    
+    function update() {
+        angle += 0.01;
+        for(var i = 0; i < 100; i++) {
+            var f = flakes[i];
+            f.y += Math.cos(angle + f.d) + 1 + f.r / 2;
+            f.x += Math.sin(angle) * 2;
+            if(f.x > W + 5 || f.x < -5 || f.y > H) {
+                if(i % 3 > 0) { flakes[i] = {x: Math.random() * W, y: -10, r: f.r, d: f.d}; }
+                else {
+                    if(Math.sin(angle) > 0) { flakes[i] = {x: -5, y: Math.random() * H, r: f.r, d: f.d}; }
+                    else { flakes[i] = {x: W + 5, y: Math.random() * H, r: f.r, d: f.d}; }
+                }
+            }
+        }
+    }
+    draw();
+})();
+</script>
+{% endif %}
+
+{% if effect == 'matrix' %}
+<script>
+(function() {
+    var a = createEffectCanvas('matrix-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    
+    var font_size = 14;
+    var columns = Math.floor(W / font_size);
+    var drops = [];
+    for(var x = 0; x < columns; x++) drops[x] = 1; 
+    var chars = "0123456789ABCDEF@#$%^&*()";
+    chars = chars.split("");
+
+    function draw() {
+        ctx.fillStyle = "rgba(0, 0, 0, 0.05)";
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "#0F0"; 
+        ctx.font = font_size + "px monospace";
+
+        for(var i = 0; i < drops.length; i++) {
+            var text = chars[Math.floor(Math.random() * chars.length)];
+            ctx.fillText(text, i * font_size, drops[i] * font_size);
+            
+            if(drops[i] * font_size > H && Math.random() > 0.975) {
+                drops[i] = 0;
+            }
+            drops[i]++;
+        }
+    }
+    setInterval(draw, 33);
+})();
+</script>
+{% endif %}
+
+{% if effect == 'rain' %}
+<script>
+(function() {
+    var a = createEffectCanvas('rain-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    
+    var drops = [];
+    var dropCount = 500;
+    
+    for (var i = 0; i < dropCount; i++) {
+        drops.push({
+            x: Math.random() * W, 
+            y: Math.random() * H, 
+            l: Math.random() * 1, 
+            v: Math.random() * 4 + 4
+        });
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.strokeStyle = "rgba(174, 194, 224, 0.5)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        
+        for (var i = 0; i < dropCount; i++) {
+            var d = drops[i];
+            ctx.moveTo(d.x, d.y);
+            ctx.lineTo(d.x, d.y + d.l * 5);
+            
+            d.y += d.v;
+            if (d.y > H) {
+                d.y = -20;
+                d.x = Math.random() * W;
+            }
+        }
+        ctx.stroke();
+        requestAnimationFrame(draw);
+    }
+    draw();
+})();
+</script>
+{% endif %}
+
+{% if effect == 'particles' %}
+<script>
+(function() {
+    var a = createEffectCanvas('particles-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    
+    var particleCount = 80;
+    var particles = [];
+    
+    for (var i = 0; i < particleCount; i++) {
+        particles.push({
+            x: Math.random() * W,
+            y: Math.random() * H,
+            vx: (Math.random() - 0.5) * 1,
+            vy: (Math.random() - 0.5) * 1
+        });
+    }
+
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(200, 200, 200, 0.5)";
+        ctx.strokeStyle = "rgba(200, 200, 200, 0.1)";
+
+        for (var i = 0; i < particles.length; i++) {
+            var p = particles[i];
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+            ctx.fill();
+
+            p.x += p.vx;
+            p.y += p.vy;
+
+            if (p.x < 0 || p.x > W) p.vx *= -1;
+            if (p.y < 0 || p.y > H) p.vy *= -1;
+
+            for (var j = i + 1; j < particles.length; j++) {
+                var p2 = particles[j];
+                var dx = p.x - p2.x;
+                var dy = p.y - p2.y;
+                var dist = Math.sqrt(dx * dx + dy * dy);
+
+                if (dist < 100) {
+                    ctx.beginPath();
+                    ctx.moveTo(p.x, p.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.stroke();
+                }
+            }
+        }
+        requestAnimationFrame(draw);
+    }
+    draw();
+})();
+</script>
+{% endif %}
+
+{% if effect == 'sakura' %}
+<script>
+(function() {
+    var a = createEffectCanvas('sakura-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    
+    var mp = 60;
+    var petals = [];
+    for(var i = 0; i < mp; i++) {
+        petals.push({
+            x: Math.random() * W, 
+            y: Math.random() * H,
+            r: Math.random() * 4 + 2, 
+            d: Math.random() * mp,
+            c: (Math.random() > 0.5) ? "#ffc0cb" : "#ffffff"
+        });
+    }
+    
+    var angle = 0;
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        for(var i = 0; i < 60; i++) {
+            var p = petals[i];
+            ctx.fillStyle = p.c;
+            ctx.globalAlpha = 0.7;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2, true);
+            ctx.fill();
+        }
+        
+        angle += 0.01;
+        for(var i = 0; i < 60; i++) {
+            var p = petals[i];
+            p.y += Math.cos(angle + p.d) + 1 + p.r / 2;
+            p.x += Math.sin(angle);
+            
+            if(p.x > W + 5 || p.x < -5 || p.y > H) {
+                p.x = Math.random() * W;
+                p.y = -10;
+            }
+        }
+        requestAnimationFrame(draw);
+    }
+    draw();
+})();
+</script>
+{% endif %}
+
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------------------------
+# 7.3 TEMPLATE XEM CHI TIẾT KHO HÀNG (STOCK_VIEW_TPL)
+# ------------------------------------------------------------------------------
+STOCK_VIEW_TPL = """
+<!doctype html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8">
+    <title>Chi tiết kho {{ group }}</title>
+    <style>
+        body {
+            background: #121212;
+            color: #e9ecef;
+            font-family: monospace;
+            padding: 20px;
+        }
+        
+        h2 { 
+            color: #5a7dff; 
+            border-bottom: 1px solid #333; 
+            padding-bottom: 10px; 
+        }
+        
+        a { 
+            color: #5a7dff; 
+            text-decoration: none; 
+            font-size: 16px; 
+        }
+        
+        a:hover { text-decoration: underline; }
+        
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            margin-top: 20px; 
+        }
+        
+        th, td { 
+            border: 1px solid #333; 
+            padding: 10px; 
+            text-align: left; 
+        }
+        
+        th { 
+            background: #1c1c1e; 
+            color: #adb5bd; 
+        }
+        
+        tr:hover { background: #1c1c1e; }
+        
+        button {
+            cursor: pointer;
+            padding: 6px 12px;
+            background: #dc3545;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        
+        button:hover { background: #bb2d3b; }
+    </style>
+</head>
+<body>
+
+    <h2>📦 Chi tiết Group: {{ group }} (Tổng: {{ items|length }})</h2>
+    
+    <p>
+        <a href="{{ url_for('admin_index') }}#local-stock">🔙 Quay lại Dashboard</a>
+    </p>
+
+    <table>
+        <thead>
+            <tr>
+                <th style="width: 50px;">ID</th>
+                <th>Nội dung (Tài khoản/Key)</th>
+                <th style="width: 200px;">Ngày thêm (VN)</th>
+                <th style="width: 100px;">Hành động</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for i in items %}
+            <tr>
+                <td>{{ i.id }}</td>
+                <td style="word-break: break-all; color: #20c997;">{{ i.content }}</td>
+                <td>{{ i.added_at }}</td>
+                <td>
+                    <form action="{{ url_for('admin_local_stock_delete_one') }}" method="post" onsubmit="return confirm('Xóa dòng này?');">
+                        <input type="hidden" name="id" value="{{ i.id }}">
+                        <input type="hidden" name="group" value="{{ group }}">
+                        <button type="submit">Xóa</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr>
+                <td colspan="4" style="text-align: center; padding: 30px; color: #adb5bd;">
+                    Kho này đang trống. Hãy quay lại để thêm hàng.
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+</body>
+</html>
+"""
+
+
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 8: FLASK ROUTES & CONTROLLERS (XỬ LÝ REQUEST)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+
+def find_map_by_key(key: str):
+    """Tìm kiếm thông tin sản phẩm dựa trên Input Key"""
+    with db() as con:
+        row = con.execute("SELECT * FROM keymaps WHERE input_key=? AND is_active=1", (key,)).fetchone()
+        return row
+
+def require_admin():
+    """Middleware kiểm tra quyền Admin"""
+    if request.cookies.get("logged_in") != ADMIN_SECRET:
+        abort(redirect(url_for('login')))
+
+@app.route("/", methods=["GET", "POST"])
+def login():
+    """Trang đăng nhập"""
+    if request.method == "POST":
+        secret = request.form.get("admin_secret")
+        if secret == ADMIN_SECRET:
+            response = make_response(redirect(url_for("admin_index")))
+            # Cookie sống 1 năm
+            response.set_cookie("logged_in", ADMIN_SECRET, max_age=31536000, httponly=True, secure=True, samesite='Lax')
+            return response
+        else:
+            flash("Mật khẩu Admin không chính xác. Vui lòng thử lại.", "error")
+            return render_template_string(LOGIN_TPL)
+    
+    # Nếu đã login thì chuyển thẳng vào admin
+    if request.cookies.get("logged_in") == ADMIN_SECRET:
+        return redirect(url_for("admin_index"))
+        
+    return render_template_string(LOGIN_TPL)
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    """Đăng xuất"""
+    response = make_response(redirect(url_for("login")))
+    response.set_cookie("logged_in", "", max_age=0) 
+    return response
+
+@app.route("/admin")
+def admin_index():
+    """Trang Dashboard chính"""
+    require_admin() 
+
+    with db() as con:
+        # 1. Lấy danh sách Keymaps
+        maps = con.execute("SELECT * FROM keymaps ORDER BY group_name, provider_type, sku, id").fetchall()
+        
+        # Gom nhóm dữ liệu để hiển thị đẹp hơn
+        grouped_data = {}
+        for key in maps:
+            folder = key['group_name'] or 'DEFAULT' 
+            provider = key['provider_type']
+            
+            if folder not in grouped_data:
+                grouped_data[folder] = {}
+            
+            if provider not in grouped_data[folder]:
+                grouped_data[folder][provider] = {}
+            
+            if provider not in grouped_data[folder][provider]:
+                 grouped_data[folder][provider] = [] # Sửa lại thành List để loop
+            
+            # Logic cũ của bạn có thể khác, ở đây tôi gom theo:
+            # Website (Folder) -> Provider -> List Keys
+            # Nhưng template đang loop provider,keys. Vậy cấu trúc dict sẽ là:
+            # grouped_data[folder][provider] = [key1, key2...]
+            
+            if isinstance(grouped_data[folder][provider], list):
+                 grouped_data[folder][provider].append(key)
+            else:
+                 # Fallback nếu có lỗi logic cũ
+                 grouped_data[folder][provider] = [key]
+        
+        # 2. Lấy danh sách Proxy (Để hiển thị bảng)
+        proxies = con.execute("SELECT * FROM proxies ORDER BY is_live DESC, latency ASC").fetchall()
+
+        # 3. Lấy cấu hình Ping
+        ping_url = con.execute("SELECT value FROM config WHERE key='ping_url'").fetchone()
+        ping_int = con.execute("SELECT value FROM config WHERE key='ping_interval'").fetchone()
+        ping_config = {
+            "url": ping_url['value'] if ping_url else "", 
+            "interval": ping_int['value'] if ping_int else 300
+        }
+
+        # 4. Lấy thống kê Local Stock
+        stock_rows = con.execute("SELECT group_name, COUNT(*) as cnt FROM local_stock GROUP BY group_name").fetchall()
+        local_stats = {r['group_name']: r['cnt'] for r in stock_rows}
+        
+        # Tạo danh sách group để gợi ý input
+        local_groups = [r['group_name'] for r in stock_rows]
+
+    # Lấy setting giao diện từ Cookie
+    effect = request.cookies.get('admin_effect', 'astronaut')
+    mode = request.cookies.get('admin_mode', 'dark') 
+    
+    return render_template_string(ADMIN_TPL, 
+                                  grouped_data=grouped_data, 
+                                  proxies=proxies, 
+                                  current_proxy=CURRENT_PROXY_STRING, 
+                                  ping=ping_config, 
+                                  local_stats=local_stats,
+                                  local_groups=local_groups,
+                                  effect=effect,
+                                  mode=mode)
+
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ KEYMAP
+# ------------------------------------------------------------------------------
+@app.route("/admin/keymap", methods=["POST"])
+def admin_add_keymap():
+    require_admin()
+    f = request.form
+    
+    group_name = f.get("group_name", "").strip()
+    sku = f.get("sku", "").strip()
+    input_key = f.get("input_key", "").strip()
+    product_id = f.get("product_id", "").strip()
+    provider_type = f.get("provider_type", "").strip()
+    base_url = f.get("base_url", "").strip()
+    api_key = f.get("api_key", "").strip()
+    
+    if not input_key or not provider_type:
+        flash("Lỗi: Thiếu thông tin bắt buộc.", "error")
+        return redirect(url_for("admin_index"))
+        
     try:
-        payload = json.loads(file.read().decode("utf-8"))
+        with db() as con:
+            con.execute("""
+                INSERT INTO keymaps(group_name, sku, input_key, product_id, api_key, is_active, provider_type, base_url)
+                VALUES(?,?,?,?,?,1,?,?)
+                ON CONFLICT(input_key) DO UPDATE SET
+                  group_name=excluded.group_name,
+                  sku=excluded.sku,
+                  product_id=excluded.product_id,
+                  api_key=excluded.api_key,
+                  provider_type=excluded.provider_type,
+                  base_url=excluded.base_url,
+                  is_active=1
+            """, (group_name, sku, input_key, product_id, api_key, provider_type, base_url))
+            con.commit()
+        flash(f"Đã lưu key '{input_key}' thành công!", "success")
     except Exception as e:
-        flash(f"Không đọc được JSON: {e}", "error")
-        return redirect(url_for("dashboard"))
+        flash(f"Lỗi Database: {e}", "error")
+        
+    return redirect(url_for("admin_index"))
 
-    if not isinstance(payload, dict):
-        flash("Định dạng backup không hợp lệ.", "error")
-        return redirect(url_for("dashboard"))
+@app.route("/admin/keymap/delete/<int:kmid>", methods=["POST"])
+def admin_delete_key(kmid):
+    require_admin()
+    with db() as con:
+        con.execute("DELETE FROM keymaps WHERE id=?", (kmid,))
+        con.commit()
+    flash("Đã xóa key thành công.", "success")
+    return redirect(url_for("admin_index"))
 
-    wipe = (request.form.get("wipe") == "1")
+@app.route("/admin/keymap/toggle/<int:kmid>", methods=["POST"])
+def admin_toggle_key(kmid):
+    require_admin()
+    with db() as con:
+        row = con.execute("SELECT is_active FROM keymaps WHERE id=?", (kmid,)).fetchone()
+        if row:
+            new_val = 0 if row['is_active'] else 1
+            con.execute("UPDATE keymaps SET is_active=? WHERE id=?", (new_val, kmid))
+            con.commit()
+    return redirect(url_for("admin_index"))
 
-    # Khôi phục settings
-    settings = payload.get("settings", {})
-    if isinstance(settings, dict):
-        for k in ["default_chat_id", "default_bot_id", "poll_interval", "global_threshold"]:
-            if k in settings:
-                set_setting(k, str(settings.get(k) if settings.get(k) is not None else ""))
 
-    # Wipe nếu yêu cầu
-    if wipe:
-        wipe_table("telegram_bots")
-        wipe_table("apis")
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ PROXY
+# ------------------------------------------------------------------------------
+@app.route("/admin/proxy/add", methods=["POST"])
+def admin_add_proxy():
+    require_admin()
+    blob = request.form.get("proxies", "").strip()
+    count = 0
+    
+    with db() as con:
+        for line in blob.split('\n'):
+            line = line.strip()
+            if line:
+                con.execute("INSERT OR IGNORE INTO proxies (proxy_string, is_live, last_checked) VALUES (?, 0, ?)", (line, get_vn_time()))
+                count += 1
+        con.commit()
+        
+        # Nếu chưa có proxy nào được chọn, tự động chọn cái mới thêm
+        if not CURRENT_PROXY_STRING:
+            select_best_available_proxy(con)
+            
+    flash(f"Đã thêm {count} proxy vào hệ thống.", "success")
+    return redirect(url_for("admin_index"))
 
-    # Khôi phục bots
-    bots = payload.get("bots", [])
-    if isinstance(bots, list):
-        for b in bots:
-            try:
-                name = (b.get("bot_name") or "").strip()
-                token = (b.get("bot_token") or "").strip()
-                if name and token:
-                    try:
-                        add_bot_db(name, token)
-                    except sqlite3.IntegrityError:
-                        pass
-            except Exception:
-                continue
+@app.route("/admin/proxy/delete", methods=["POST"])
+def admin_delete_proxy():
+    require_admin()
+    with db() as con:
+        con.execute("DELETE FROM proxies WHERE id=?", (request.form.get("id"),))
+        con.commit()
+    return redirect(url_for("admin_index"))
 
-    # Khôi phục apis
-    apis = payload.get("apis", [])
-    if isinstance(apis, list):
-        for a in apis:
-            try:
-                name = (a.get("name") or "").strip()
-                url = (a.get("url") or "").strip()
-                field = (a.get("balance_field") or "").strip()
-                if name and url:
-                    new_id = add_api_db(name, url, field)
-                    try:
-                        last_bal = a.get("last_balance", None)
-                        last_chg = a.get("last_change", None)
-                        if last_bal is not None and last_chg:
-                            update_api_state(new_id, float(last_bal), str(last_chg))
-                    except Exception:
-                        pass
-            except Exception:
-                continue
 
-    flash("Phục hồi dữ liệu từ JSON thành công.", "ok")
-    return redirect(url_for("dashboard"))
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ PING (ANTI-SLEEP)
+# ------------------------------------------------------------------------------
+@app.route("/admin/ping/save", methods=["POST"])
+def admin_save_ping():
+    require_admin()
+    url = request.form.get("ping_url", "").strip()
+    interval = request.form.get("ping_interval", "300").strip()
+    
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO config(key,value) VALUES('ping_url', ?)", (url,))
+        con.execute("INSERT OR REPLACE INTO config(key,value) VALUES('ping_interval', ?)", (interval,))
+        con.commit()
+        
+    flash("Đã lưu cấu hình Ping Service.", "success")
+    return redirect(url_for("admin_index"))
+
+
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ LOCAL STOCK (KHO HÀNG THỦ CÔNG) - ĐÃ FIX GIỜ VN & FILE
+# ------------------------------------------------------------------------------
+@app.route("/admin/local-stock/add", methods=["POST"])
+def admin_local_stock_add():
+    require_admin()
+    grp = request.form.get("group_name", "").strip()
+    content = request.form.get("content", "").strip()
+    file = request.files.get("stock_file")
+    
+    if not grp:
+        flash("Thiếu tên Group.", "error")
+        return redirect(url_for("admin_index") + "#local-stock")
+    
+    lines = []
+    # Ưu tiên đọc file TXT
+    if file and file.filename:
+        try:
+            lines = file.read().decode('utf-8', errors='ignore').splitlines()
+        except Exception as e:
+            flash(f"Lỗi đọc file: {e}", "error")
+            return redirect(url_for("admin_index") + "#local-stock")
+    # Nếu không có file thì đọc từ ô text
+    elif content:
+        lines = content.split('\n')
+    
+    count = 0
+    if lines:
+        with db() as con:
+            now = get_vn_time() # Dùng giờ Việt Nam
+            for line in lines:
+                line = line.strip()
+                if line:
+                    con.execute("INSERT INTO local_stock(group_name, content, added_at) VALUES(?,?,?)", (grp, line, now))
+                    count += 1
+            con.commit()
+        
+    flash(f"Đã thêm {count} dòng vào kho '{grp}'.", "success")
+    return redirect(url_for("admin_index") + "#local-stock")
+
+@app.route("/admin/local-stock/view")
+def admin_local_stock_view():
+    require_admin()
+    grp = request.args.get("group")
+    with db() as con:
+        items = con.execute("SELECT * FROM local_stock WHERE group_name=?", (grp,)).fetchall()
+    return render_template_string(STOCK_VIEW_TPL, group=grp, items=items)
+
+@app.route("/admin/local-stock/delete-one", methods=["POST"])
+def admin_local_stock_delete_one():
+    require_admin()
+    with db() as con:
+        con.execute("DELETE FROM local_stock WHERE id=?", (request.form.get("id"),))
+        con.commit()
+    return redirect(url_for("admin_local_stock_view", group=request.form.get("group")))
+
+@app.route("/admin/local-stock/clear", methods=["POST"])
+def admin_local_stock_clear():
+    require_admin()
+    grp = request.form.get("group_name")
+    with db() as con:
+        con.execute("DELETE FROM local_stock WHERE group_name=?", (grp,))
+        con.commit()
+    flash(f"Đã xóa sạch kho '{grp}'.", "success")
+    return redirect(url_for("admin_index") + "#local-stock")
+
+
+# ------------------------------------------------------------------------------
+# ROUTES: BACKUP & RESTORE
+# ------------------------------------------------------------------------------
+@app.route("/admin/backup/download")
+def admin_backup_download():
+    require_admin()
+    # Gọi hàm backup ngay lập tức để có dữ liệu mới nhất
+    perform_backup_to_file()
+    
+    if os.path.exists(AUTO_BACKUP_FILE):
+        with open(AUTO_BACKUP_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # Thêm thời gian xuất file
+            data['export_time'] = get_vn_time()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            response = jsonify(data)
+            response.headers['Content-Disposition'] = f'attachment; filename=full_backup_{timestamp}.json'
+            return response
+    return "Chưa có dữ liệu backup.", 404
+
+@app.route("/admin/backup/upload", methods=["POST"])
+def admin_backup_upload():
+    require_admin()
+    file = request.files.get('backup_file')
+    
+    if file and file.filename.endswith('.json'):
+        try:
+            data = json.load(file)
+            with db() as con:
+                # Xóa dữ liệu cũ
+                con.execute("DELETE FROM keymaps")
+                con.execute("DELETE FROM proxies")
+                con.execute("DELETE FROM local_stock")
+                
+                # Restore Keymaps
+                keymaps = data if isinstance(data, list) else data.get('keymaps', [])
+                for k in keymaps:
+                    con.execute("""
+                        INSERT INTO keymaps(sku,input_key,product_id,is_active,group_name,provider_type,base_url,api_key) 
+                        VALUES(?,?,?,?,?,?,?,?)
+                    """, (k.get('sku'), k.get('input_key'), k.get('product_id'), k.get('is_active',1), 
+                          k.get('group_name'), k.get('provider_type'), k.get('base_url'), k.get('api_key')))
+                
+                # Restore Proxies
+                proxies = data.get('proxies', []) if isinstance(data, dict) else []
+                for p in proxies:
+                    con.execute("INSERT OR IGNORE INTO proxies(proxy_string, is_live, latency, last_checked) VALUES(?,?,?,?)", 
+                                (p.get('proxy_string'), 0, 9999.0, get_vn_time()))
+                
+                # Restore Local Stock
+                local = data.get('local_stock', []) if isinstance(data, dict) else []
+                for l in local:
+                    con.execute("INSERT INTO local_stock(group_name, content, added_at) VALUES(?,?,?)",
+                                (l.get('group_name'), l.get('content'), l.get('added_at')))
+                
+                # Restore Config
+                config = data.get('config', {}) if isinstance(data, dict) else {}
+                for k, v in config.items():
+                    con.execute("INSERT OR REPLACE INTO config(key,value) VALUES(?,?)", (k, str(v)))
+                    
+                con.commit()
+                
+            flash("Khôi phục dữ liệu thành công!", "success")
+        except Exception as e:
+            flash(f"Lỗi khôi phục: {e}", "error")
+    else:
+        flash("File không hợp lệ.", "error")
+        
+    return redirect(url_for("admin_index"))
+
+
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 9: PUBLIC API (CHO NGƯỜI MUA)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
+
+@app.route("/stock")
+def stock():
+    """API kiểm tra tồn kho"""
+    key = request.args.get("key", "").strip()
+    if not key:
+        return jsonify({"sum": 0}), 200
+        
+    row = find_map_by_key(key) 
+    if not row:
+        return jsonify({"sum": 0}), 200
+    
+    # Nếu là kho Local
+    if row['provider_type'] == 'local': 
+        return jsonify({"sum": get_local_stock_count(row['group_name'])})
+    
+    # Nếu là API ngoài (Mail72h)
+    return stock_mail72h_format(row) 
+
+@app.route("/fetch")
+def fetch():
+    """API lấy hàng (Mua hàng)"""
+    key = request.args.get("key", "").strip()
+    qty_s = request.args.get("quantity", "").strip()
+    
+    try:
+        qty = int(qty_s)
+    except:
+        return jsonify([]), 200
+    
+    row = find_map_by_key(key) 
+    if not row:
+        return jsonify([]), 200
+    
+    # Nếu là kho Local
+    if row['provider_type'] == 'local': 
+        return jsonify(fetch_local_stock(row['group_name'], qty))
+    
+    # Nếu là API ngoài
+    return fetch_mail72h_format(row, qty)
 
 @app.route("/health")
 def health():
-    return {"status": "ok", "watcher_running": watcher_running}
+    return "OK", 200
 
-# =========================
-# KHỞI ĐỘNG
-# =========================
-def init_and_run():
-    init_db()
-    start_watcher_once()
 
-init_and_run()
+# ==============================================================================
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 10: KHỞI ĐỘNG (STARTUP)
+#
+# ------------------------------------------------------------------------------
+# ==============================================================================
 
+# QUAN TRỌNG: Chạy init_db() ngay khi file được import (để Gunicorn chạy nó)
+print("INFO: Đang khởi tạo Database...")
+init_db() 
+
+# Khởi động các luồng chạy nền (Proxy checker, Ping, Backup)
+if not proxy_checker_started:
+    start_proxy_checker_once() 
+if not ping_service_started:
+    start_ping_service()
+if not auto_backup_started:
+    start_auto_backup()
+
+# Logic khôi phục Proxy (chỉ chạy 1 lần khi khởi động)
+try:
+    with db() as con_startup:
+        manual_proxy_choice = load_selected_proxy_from_db(con_startup)
+        if manual_proxy_choice:
+            print(f"INFO: Đang khôi phục proxy đã lưu: {manual_proxy_choice}")
+            is_live, latency = check_proxy_live(manual_proxy_choice)
+            if is_live:
+                set_current_proxy_by_string(manual_proxy_choice)
+                update_proxy_state(manual_proxy_choice, is_live, latency)
+            else:
+                print("WARNING: Proxy đã lưu bị chết. Đang quét lại...")
+                run_initial_proxy_scan_and_select()
+        else:
+            run_initial_proxy_scan_and_select()
+except Exception as e:
+    print(f"STARTUP ERROR (Non-critical): {e}")
+
+# Block này chỉ chạy khi bạn test trên máy tính (python app.py)
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", "8000"))
+    print(f"🚀 SERVER STARTED ON PORT {port}")
     app.run(host="0.0.0.0", port=port)
