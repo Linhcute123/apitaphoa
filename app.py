@@ -10,32 +10,22 @@ from flask import Flask, request, jsonify, abort, redirect, url_for, render_temp
 import requests
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
-#
-#   PHẦN 1: CẤU HÌNH HỆ THỐNG (SYSTEM CONFIGURATION)
-#
-# ------------------------------------------------------------------------------
+# 1. CẤU HÌNH HỆ THỐNG (SYSTEM CONFIGURATION)
 # ==============================================================================
 
-# Đường dẫn file Database SQLite
-# Lưu ý: Trên Render Free, file này sẽ bị reset khi server khởi động lại.
-# Chúng ta dùng cơ chế Auto Restore từ Secret File để khắc phục điều này.
+# Đường dẫn Database SQLite
 DB = os.getenv("DB_PATH", "store.db") 
 
-# Đường dẫn file Secret Backup trên Render (Lấy từ biến môi trường)
-# File này được mount từ "Secret Files" của Render, dùng để lưu dữ liệu bền vững.
-# Giá trị mặc định: /etc/secrets/backupapitaphoa.json
+# Đường dẫn file Secret Backup trên Render
 SECRET_BACKUP_FILE_PATH = os.getenv("SECRET_BACKUP_FILE_PATH", "/etc/secrets/backupapitaphoa.json")
 
-# Tên file backup tự động sinh ra (Lưu tạm thời trên ổ cứng)
-# Dùng để tải về máy tính thông qua Admin Dashboard
+# Tên file backup tự động sinh ra
 AUTO_BACKUP_FILE = "auto_backup.json"
 
 # Mật khẩu quản trị viên (Admin)
-# Hãy thay đổi giá trị này trong Environment Variables trên Render để bảo mật
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
 
-# Thời gian chờ (Timeout) mặc định cho các request API ra ngoài (tính bằng giây)
+# Timeout mặc định cho các request API ra ngoài (giây)
 DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "5")) 
 
 # Thời gian (giây) giữa các lần kiểm tra Proxy tự động
@@ -46,94 +36,55 @@ app = Flask(__name__)
 app.secret_key = ADMIN_SECRET 
 
 # Biến toàn cục lưu trữ cấu hình Proxy đang hoạt động
-# Được sử dụng bởi các luồng check proxy và API mua hàng
-CURRENT_PROXY_SET = {
-    "http": None, 
-    "https": None
-}
+CURRENT_PROXY_SET = {"http": None, "https": None}
 CURRENT_PROXY_STRING = "" 
 
-# Khóa thread (Mutex) để tránh xung đột khi nhiều luồng cùng ghi vào Database
+# Khóa thread để tránh xung đột DB
 db_lock = threading.Lock()
 
 # Cờ kiểm soát trạng thái các luồng chạy ngầm
-# Giúp đảm bảo mỗi luồng chỉ được khởi động một lần duy nhất
 proxy_checker_started = False
 ping_service_started = False
 auto_backup_started = False
 
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
-#
-#   PHẦN 2: TIỆN ÍCH THỜI GIAN (TIMEZONE UTILS)
-#
-# ------------------------------------------------------------------------------
+# 2. TIỆN ÍCH THỜI GIAN (TIMEZONE UTILS - VIETNAM TIME)
 # ==============================================================================
 
 def get_vn_time():
     """
     Hàm lấy thời gian hiện tại theo múi giờ Việt Nam (UTC+7).
-    Server Render thường chạy giờ UTC (0), nên cần cộng thêm 7 giờ.
-    
-    Returns:
-        str: Chuỗi thời gian định dạng 'YYYY-MM-DD HH:MM:SS'
     """
-    # Lấy giờ UTC hiện tại
     utc_now = datetime.datetime.utcnow()
-    
-    # Cộng thêm 7 giờ
     vn_now = utc_now + datetime.timedelta(hours=7)
-    
-    # Trả về chuỗi định dạng
     return vn_now.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
-#
-#   PHẦN 3: CÁC HÀM XỬ LÝ DATABASE (DB UTILS)
-#
-# ------------------------------------------------------------------------------
+# 3. CÁC HÀM XỬ LÝ DATABASE (DB UTILS)
 # ==============================================================================
 
 def db():
-    """
-    Tạo kết nối mới đến Database SQLite.
-    Sử dụng sqlite3.Row để có thể truy cập dữ liệu theo tên cột (dict-like).
-    """
+    """Kết nối đến SQLite Database."""
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row 
     return con
 
 def _ensure_col(con, table, col, decl):
-    """
-    Hàm phụ trợ để đảm bảo một cột tồn tại trong bảng.
-    Dùng để tự động cập nhật cấu trúc bảng (Migration) khi code thay đổi.
-    """
+    """Đảm bảo cột tồn tại trong bảng (Migration)."""
     try:
-        query = f"ALTER TABLE {table} ADD COLUMN {col} {decl}"
-        con.execute(query)
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     except Exception:
-        # Bỏ qua lỗi nếu cột đã tồn tại
         pass
 
 def init_db():
-    """
-    Hàm khởi tạo Database quan trọng nhất.
-    Chức năng:
-    1. Tạo các bảng nếu chưa tồn tại.
-    2. Cập nhật cấu trúc bảng cũ (Migration).
-    3. Khởi tạo các giá trị cấu hình mặc định.
-    4. Tự động khôi phục dữ liệu từ Secret File nếu DB trống (quan trọng cho Render).
-    """
+    """Khởi tạo Database, tạo bảng và khôi phục dữ liệu."""
     with db_lock:
         with db() as con:
             print(f"INFO: Đang kết nối và khởi tạo Database tại: {DB}")
             
-            # -------------------------------------------------------
-            # TẠO BẢNG KEYMAPS (Quản lý Key bán hàng)
-            # -------------------------------------------------------
+            # --- TẠO BẢNG KEYMAPS ---
             con.execute("""
                 CREATE TABLE IF NOT EXISTS keymaps(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -148,9 +99,7 @@ def init_db():
                 )
             """)
             
-            # -------------------------------------------------------
-            # TẠO BẢNG CONFIG (Lưu cấu hình hệ thống)
-            # -------------------------------------------------------
+            # --- TẠO BẢNG CONFIG ---
             con.execute("""
                 CREATE TABLE IF NOT EXISTS config(
                     key TEXT PRIMARY KEY,
@@ -158,9 +107,7 @@ def init_db():
                 )
             """)
             
-            # -------------------------------------------------------
-            # TẠO BẢNG PROXIES (Quản lý danh sách Proxy)
-            # -------------------------------------------------------
+            # --- TẠO BẢNG PROXIES ---
             con.execute("""
                 CREATE TABLE IF NOT EXISTS proxies(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,9 +118,7 @@ def init_db():
                 )
             """)
             
-            # -------------------------------------------------------
-            # TẠO BẢNG LOCAL STOCK (Kho hàng thủ công)
-            # -------------------------------------------------------
+            # --- TẠO BẢNG LOCAL STOCK ---
             con.execute("""
                 CREATE TABLE IF NOT EXISTS local_stock(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,470 +128,246 @@ def init_db():
                 )
             """)
             
-            # -------------------------------------------------------
-            # CẬP NHẬT CẤU TRÚC BẢNG (MIGRATION)
-            # -------------------------------------------------------
+            # --- CẬP NHẬT CẤU TRÚC BẢNG ---
             _ensure_col(con, "keymaps", "group_name", "TEXT")
             _ensure_col(con, "keymaps", "provider_type", "TEXT NOT NULL DEFAULT 'mail72h'")
             _ensure_col(con, "keymaps", "base_url", "TEXT")
             _ensure_col(con, "keymaps", "api_key", "TEXT")
             
-            # Dọn dẹp các cột cũ không còn sử dụng
-            try: 
-                con.execute("ALTER TABLE keymaps DROP COLUMN note")
-            except: 
-                pass
+            try: con.execute("ALTER TABLE keymaps DROP COLUMN note")
+            except: pass
+            try: con.execute("ALTER TABLE keymaps RENAME COLUMN mail72h_api_key TO api_key")
+            except: pass
             
-            try: 
-                con.execute("ALTER TABLE keymaps RENAME COLUMN mail72h_api_key TO api_key")
-            except: 
-                pass
-            
-            # -------------------------------------------------------
-            # KHỞI TẠO DỮ LIỆU MẶC ĐỊNH
-            # -------------------------------------------------------
-            # Xóa cấu hình proxy tạm cũ
+            # --- KHỞI TẠO DỮ LIỆU MẶC ĐỊNH ---
             con.execute("DELETE FROM config WHERE key='current_proxy_string'")
-            
-            # Đảm bảo các key config tồn tại
             con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("selected_proxy_string", ""))
             con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("ping_url", ""))
             con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("ping_interval", "300"))
             
             con.commit()
 
-            # -------------------------------------------------------
-            # LOGIC AUTO RESTORE (KHÔI PHỤC DỮ LIỆU TỰ ĐỘNG)
-            # -------------------------------------------------------
-            # Kiểm tra xem bảng keymaps có trống không.
+            # --- AUTO RESTORE LOGIC ---
             keymap_count = con.execute("SELECT COUNT(*) FROM keymaps").fetchone()[0]
             
             if keymap_count == 0:
-                print("WARNING: Database đang trống (Do Render vừa Restart).")
-                print("INFO: Đang tìm kiếm file Backup bí mật để khôi phục dữ liệu...")
-                
+                print("WARNING: Database đang trống. Đang tìm file Backup...")
                 if SECRET_BACKUP_FILE_PATH and os.path.exists(SECRET_BACKUP_FILE_PATH):
                     print(f"INFO: Tìm thấy file backup tại: {SECRET_BACKUP_FILE_PATH}")
                     try:
                         with open(SECRET_BACKUP_FILE_PATH, 'r', encoding='utf-8') as f:
                             data = json.load(f)
                         
-                        # Chuẩn bị biến chứa dữ liệu
                         keymaps_to_import = []
                         config_to_import = {}
                         proxies_to_import = []
                         local_stock_to_import = []
 
-                        # Kiểm tra định dạng file backup (Cũ hay Mới)
                         if isinstance(data, list):
-                            # Format cũ: Chỉ là danh sách keymaps
-                            print("INFO: Phát hiện backup định dạng cũ (List).")
                             keymaps_to_import = data
                         elif isinstance(data, dict):
-                            # Format mới: Dictionary chứa đầy đủ các bảng
-                            print("INFO: Phát hiện backup định dạng mới (Full Dictionary).")
                             keymaps_to_import = data.get('keymaps', [])
                             config_to_import = data.get('config', {})
                             proxies_to_import = data.get('proxies', [])
                             local_stock_to_import = data.get('local_stock', [])
 
-                        # 1. Restore Keymaps
-                        print(f"INFO: Đang khôi phục {len(keymaps_to_import)} keys...")
+                        # Restore Data
                         for item in keymaps_to_import:
-                            con.execute("""
-                                INSERT OR IGNORE INTO keymaps(
-                                    sku, input_key, product_id, is_active, 
-                                    group_name, provider_type, base_url, api_key
-                                ) 
-                                VALUES(?,?,?,?,?,?,?,?)
-                            """, (
-                                item.get('sku'), 
-                                item.get('input_key'),
-                                item.get('product_id'), 
-                                item.get('is_active', 1),
-                                item.get('group_name', item.get('base_url', 'DEFAULT')), 
-                                item.get('provider_type', 'mail72h'),
-                                item.get('base_url'), 
-                                item.get('api_key')
-                            ))
+                            con.execute("""INSERT OR IGNORE INTO keymaps(sku, input_key, product_id, is_active, group_name, provider_type, base_url, api_key) VALUES(?,?,?,?,?,?,?,?)""", 
+                                        (item.get('sku'), item.get('input_key'), item.get('product_id'), item.get('is_active', 1), item.get('group_name'), item.get('provider_type', 'mail72h'), item.get('base_url'), item.get('api_key')))
 
-                        # 2. Restore Config
-                        print(f"INFO: Đang khôi phục cấu hình...")
-                        for key, value in config_to_import.items():
-                            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+                        for k, v in config_to_import.items():
+                            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (k, str(v)))
                         
-                        # 3. Restore Proxies
-                        print(f"INFO: Đang khôi phục {len(proxies_to_import)} proxies...")
                         for item in proxies_to_import:
-                            con.execute("""
-                                INSERT OR IGNORE INTO proxies (proxy_string, is_live, latency, last_checked)
-                                VALUES (?, ?, ?, ?)
-                            """, (
-                                item.get('proxy_string'), 
-                                item.get('is_live', 0),
-                                item.get('latency', 9999.0), 
-                                get_vn_time()
-                            ))
+                            con.execute("INSERT OR IGNORE INTO proxies (proxy_string, is_live, latency, last_checked) VALUES (?, ?, ?, ?)", 
+                                        (item.get('proxy_string'), 0, 9999.0, get_vn_time()))
                             
-                        # 4. Restore Local Stock
-                        print(f"INFO: Đang khôi phục {len(local_stock_to_import)} dòng local stock...")
                         for item in local_stock_to_import:
-                            con.execute("""
-                                INSERT INTO local_stock (group_name, content, added_at)
-                                VALUES (?, ?, ?)
-                            """, (
-                                item.get('group_name'), 
-                                item.get('content'), 
-                                item.get('added_at')
-                            ))
+                            con.execute("INSERT INTO local_stock (group_name, content, added_at) VALUES (?, ?, ?)", 
+                                        (item.get('group_name'), item.get('content'), item.get('added_at')))
                         
                         con.commit()
-                        print(f"SUCCESS: Đã khôi phục dữ liệu thành công từ Secret File!")
-                        
+                        print("SUCCESS: Khôi phục dữ liệu thành công!")
                     except Exception as e:
-                        print(f"ERROR: Khôi phục thất bại. Lỗi chi tiết: {e}")
-                else:
-                    print(f"ERROR: Không tìm thấy file backup tại {SECRET_BACKUP_FILE_PATH}. Vui lòng kiểm tra biến môi trường SECRET_BACKUP_FILE_PATH.")
-            else:
-                 print("INFO: Database đã có dữ liệu. Bỏ qua bước khôi phục tự động.")
+                        print(f"ERROR: Khôi phục thất bại: {e}")
 
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
-#
-#   PHẦN 4: XỬ LÝ PROXY (PROXY UTILS)
-#
-# ------------------------------------------------------------------------------
+# 4. XỬ LÝ PROXY (PROXY UTILS)
 # ==============================================================================
 
 def format_proxy_url(proxy_string: str) -> dict:
-    """
-    Chuyển đổi chuỗi proxy (ip:port hoặc ip:port:user:pass) 
-    thành dictionary URL định dạng chuẩn cho thư viện requests.
-    """
-    if not proxy_string:
-        return {"http": None, "https": None}
-        
+    if not proxy_string: return {"http": None, "https": None}
     parts = proxy_string.split(':')
     formatted_proxy = ""
-    
     if len(parts) == 2:
-        # Định dạng IP:Port
         ip, port = parts
         formatted_proxy = f"http://{ip}:{port}"
     elif len(parts) == 4:
-        # Định dạng IP:Port:User:Pass
         ip, port, user, passwd = parts
         formatted_proxy = f"http://{user}:{passwd}@{ip}:{port}"
     else:
         return {"http": None, "https": None}
-        
     return {"http": formatted_proxy, "https": formatted_proxy}
 
 def check_proxy_live(proxy_string: str) -> tuple:
-    """
-    Kiểm tra xem một proxy có hoạt động hay không.
-    Gửi request nhẹ đến Google generate_204.
-    Trả về: (is_live (0/1), latency (seconds))
-    """
     formatted_proxies = format_proxy_url(proxy_string)
-    if not formatted_proxies.get("http"):
-        return (0, 9999.0) 
-
+    if not formatted_proxies.get("http"): return (0, 9999.0) 
     try:
         start_time = time.time()
-        requests.get("http://www.google.com/generate_204", 
-                     proxies=formatted_proxies, 
-                     timeout=DEFAULT_TIMEOUT * 2)
-        latency = time.time() - start_time
-        return (1, latency)
-    except Exception:
-        return (0, 9999.0)
+        requests.get("http://www.google.com/generate_204", proxies=formatted_proxies, timeout=DEFAULT_TIMEOUT * 2)
+        return (1, time.time() - start_time)
+    except Exception: return (0, 9999.0)
 
 def update_proxy_state(proxy_string: str, is_live: int, latency: float):
-    """
-    Cập nhật trạng thái (Live/Die) và độ trễ (Latency) của proxy vào Database.
-    """
     with db_lock:
         with db() as con:
-            con.execute("""
-                UPDATE proxies SET is_live=?, latency=?, last_checked=?
-                WHERE proxy_string=?
-            """, (is_live, latency, get_vn_time(), proxy_string))
+            con.execute("UPDATE proxies SET is_live=?, latency=?, last_checked=? WHERE proxy_string=?", (is_live, latency, get_vn_time(), proxy_string))
             con.commit()
 
 def get_proxies_from_db():
-    """Lấy toàn bộ danh sách proxy từ DB, sắp xếp ưu tiên Live và nhanh nhất."""
     with db_lock:
-        with db() as con:
-            return con.execute("SELECT * FROM proxies ORDER BY is_live DESC, latency ASC").fetchall()
+        with db() as con: return con.execute("SELECT * FROM proxies ORDER BY is_live DESC, latency ASC").fetchall()
 
 def load_selected_proxy_from_db(con):
-    """Đọc proxy đang được chọn (Active) từ bảng Config."""
     row = con.execute("SELECT value FROM config WHERE key=?", ("selected_proxy_string",)).fetchone()
     return row['value'] if row else ""
 
 def set_current_proxy_by_string(proxy_string: str):
-    """
-    Cập nhật biến toàn cục CURRENT_PROXY_SET để sử dụng cho các request API sau này.
-    """
     global CURRENT_PROXY_SET, CURRENT_PROXY_STRING
-    
     if not proxy_string:
-        CURRENT_PROXY_SET = {"http": None, "https": None}
-        CURRENT_PROXY_STRING = ""
+        CURRENT_PROXY_SET, CURRENT_PROXY_STRING = {"http": None, "https": None}, ""
         return
-
     formatted = format_proxy_url(proxy_string)
     if formatted.get("http"):
-        CURRENT_PROXY_SET = formatted
-        CURRENT_PROXY_STRING = proxy_string
+        CURRENT_PROXY_SET, CURRENT_PROXY_STRING = formatted, proxy_string
     else:
-        CURRENT_PROXY_SET = {"http": None, "https": None}
-        CURRENT_PROXY_STRING = ""
+        CURRENT_PROXY_SET, CURRENT_PROXY_STRING = {"http": None, "https": None}, ""
 
 def select_best_available_proxy(con):
-    """
-    Tự động chọn một proxy Live tốt nhất (Ping thấp nhất) từ Database.
-    Lưu kết quả vào bảng Config.
-    """
-    live_proxy = con.execute(
-        "SELECT proxy_string FROM proxies WHERE is_live=1 ORDER BY latency ASC LIMIT 1"
-    ).fetchone()
-    
-    new_proxy_string = ""
-    if live_proxy:
-        new_proxy_string = live_proxy['proxy_string']
-    
+    live_proxy = con.execute("SELECT proxy_string FROM proxies WHERE is_live=1 ORDER BY latency ASC LIMIT 1").fetchone()
+    new_proxy_string = live_proxy['proxy_string'] if live_proxy else ""
     set_current_proxy_by_string(new_proxy_string)
-    con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", 
-                ("selected_proxy_string", new_proxy_string))
+    con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", ("selected_proxy_string", new_proxy_string))
     con.commit()
     return new_proxy_string
 
 def switch_to_next_live_proxy():
-    """
-    Chức năng Failover:
-    Khi proxy hiện tại bị lỗi, hàm này sẽ tìm proxy Live tốt nhất tiếp theo để thay thế.
-    """
     with db_lock:
         with db() as con:
-            live_proxies = con.execute("""
-                SELECT proxy_string FROM proxies 
-                WHERE is_live=1 AND proxy_string != ? 
-                ORDER BY latency ASC
-            """, (CURRENT_PROXY_STRING,)).fetchall()
-            
-            new_proxy_string = ""
-            if live_proxies:
-                new_proxy_string = live_proxies[0]['proxy_string']
-            
+            live_proxies = con.execute("SELECT proxy_string FROM proxies WHERE is_live=1 AND proxy_string != ? ORDER BY latency ASC", (CURRENT_PROXY_STRING,)).fetchall()
+            new_proxy_string = live_proxies[0]['proxy_string'] if live_proxies else ""
             set_current_proxy_by_string(new_proxy_string)
-            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", 
-                        ("selected_proxy_string", new_proxy_string))
+            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", ("selected_proxy_string", new_proxy_string))
             con.commit()
-            
-            if new_proxy_string:
-                print(f"INFO: (Failover) Đã tự động chuyển sang proxy: {new_proxy_string}")
-            else:
-                print("WARNING: Không tìm thấy proxy nào khả dụng để thay thế.")
-            
             return new_proxy_string
 
 def run_initial_proxy_scan_and_select():
-    """
-    Chạy quét toàn bộ proxy một lượt khi khởi động ứng dụng.
-    """
-    print("INFO: (Startup) Đang chạy quét kiểm tra proxy lần đầu...")
-    proxies = get_proxies_from_db() 
-    if not proxies:
-        return
-
+    print("INFO: Scanning proxies...")
+    proxies = get_proxies_from_db()
+    if not proxies: return
     for row in proxies:
-        proxy_string = row['proxy_string']
-        is_live, latency = check_proxy_live(proxy_string)
-        update_proxy_state(proxy_string, is_live, latency)
-        
+        s = row['proxy_string']
+        l, lat = check_proxy_live(s)
+        update_proxy_state(s, l, lat)
     with db_lock:
-        with db() as con:
-            select_best_available_proxy(con)
+        with db() as con: select_best_available_proxy(con)
 
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
-#
-#   PHẦN 5: CÁC LUỒNG CHẠY NỀN (BACKGROUND THREADS)
-#
-# ------------------------------------------------------------------------------
+# 5. BACKGROUND THREADS
 # ==============================================================================
 
-# --- THREAD 1: PROXY CHECKER ---
 def proxy_checker_loop():
-    """
-    Luồng chạy ngầm định kỳ kiểm tra trạng thái của tất cả Proxy.
-    Nếu proxy đang dùng bị chết, nó sẽ tự động đổi sang cái khác.
-    """
-    print(f"INFO: Luồng Proxy Checker đã bắt đầu (Interval: {PROXY_CHECK_INTERVAL}s).")
     time.sleep(2) 
-
     while True:
         try:
             proxies = get_proxies_from_db()
             current_proxy_still_live = False
-
             for row in proxies:
-                proxy_string = row['proxy_string']
-                # Kiểm tra trạng thái thực tế
-                is_live, latency = check_proxy_live(proxy_string)
-                # Cập nhật vào DB
-                update_proxy_state(proxy_string, is_live, latency)
-                
-                if is_live and proxy_string == CURRENT_PROXY_STRING:
-                    current_proxy_still_live = True
-                
-                time.sleep(0.5) # Delay nhẹ để tránh spam request
-
-            # Nếu proxy đang dùng bị chết -> Đổi ngay lập tức
-            if CURRENT_PROXY_STRING and not current_proxy_still_live:
-                print(f"WARNING: Proxy hiện tại {CURRENT_PROXY_STRING} đã chết. Đang tìm proxy thay thế...")
-                switch_to_next_live_proxy() 
-            
-        except Exception as e:
-            print(f"PROXY_CHECKER_ERROR: {e}")
-        
+                s = row['proxy_string']
+                l, lat = check_proxy_live(s)
+                update_proxy_state(s, l, lat)
+                if l and s == CURRENT_PROXY_STRING: current_proxy_still_live = True
+                time.sleep(0.5) 
+            if CURRENT_PROXY_STRING and not current_proxy_still_live: switch_to_next_live_proxy() 
+        except Exception as e: print(f"PROXY_CHECKER_ERROR: {e}")
         time.sleep(PROXY_CHECK_INTERVAL)
 
 def start_proxy_checker_once():
     global proxy_checker_started
     if not proxy_checker_started:
         proxy_checker_started = True
-        t = threading.Thread(target=proxy_checker_loop, daemon=True)
-        t.start()
+        threading.Thread(target=proxy_checker_loop, daemon=True).start()
 
-# --- THREAD 2: PING SERVICE (ANTI-SLEEP) ---
 def ping_loop():
-    """
-    Luồng chạy ngầm gửi request đến chính URL của web hoặc URL chỉ định
-    để ngăn chặn các dịch vụ Free (như Render) cho ứng dụng vào chế độ ngủ đông.
-    """
-    print("INFO: Ping Service (Anti-Sleep) đã bắt đầu.")
     while True:
         try:
-            target_url = ""
-            interval = 300 # Mặc định 5 phút (300s)
-            
+            target_url = ""; interval = 300 
             with db() as con:
                 r1 = con.execute("SELECT value FROM config WHERE key='ping_url'").fetchone()
                 r2 = con.execute("SELECT value FROM config WHERE key='ping_interval'").fetchone()
                 if r1: target_url = r1['value']
                 if r2: interval = int(r2['value'])
-            
             if target_url and target_url.startswith("http"):
-                try:
-                    # Gửi request GET timeout ngắn
-                    requests.get(target_url, timeout=10)
-                    # print(f"PING SUCCESS: {target_url}")
-                except Exception as e:
-                    print(f"PING ERROR: Không thể ping đến {target_url}. Lỗi: {e}")
-            
-            if interval < 10: interval = 10 # Giới hạn tối thiểu 10s
-            time.sleep(interval)
-        except Exception as e:
-            print(f"Ping Loop Error: {e}")
-            time.sleep(60)
+                try: requests.get(target_url, timeout=10)
+                except: pass
+            time.sleep(max(10, interval))
+        except: time.sleep(60)
 
 def start_ping_service():
     global ping_service_started
     if not ping_service_started:
         ping_service_started = True
-        t = threading.Thread(target=ping_loop, daemon=True)
-        t.start()
+        threading.Thread(target=ping_loop, daemon=True).start()
 
-# --- THREAD 3: AUTO BACKUP (TỰ ĐỘNG SAO LƯU) ---
 def perform_backup_to_file():
-    """
-    Hàm thực hiện sao lưu toàn bộ dữ liệu Database ra file JSON.
-    """
     try:
         with db_lock:
             with db() as con:
-                # Lấy toàn bộ dữ liệu từ các bảng
-                keymaps = [dict(row) for row in con.execute("SELECT * FROM keymaps").fetchall()]
-                config = {row['key']: row['value'] for row in con.execute("SELECT key, value FROM config").fetchall()}
-                proxies = [dict(row) for row in con.execute("SELECT * FROM proxies").fetchall()]
-                local_stock = [dict(row) for row in con.execute("SELECT * FROM local_stock").fetchall()]
-
-        backup_data = {
-            "keymaps": keymaps,
-            "config": config,
-            "proxies": proxies,
-            "local_stock": local_stock,
-            "generated_at": get_vn_time()
-        }
-        
-        # Ghi ra file JSON
-        with open(AUTO_BACKUP_FILE, 'w', encoding='utf-8') as f:
-            json.dump(backup_data, f, ensure_ascii=False, indent=2)
-            
-    except Exception as e:
-        print(f"AUTO BACKUP ERROR: {e}")
+                data = {
+                    "keymaps": [dict(row) for row in con.execute("SELECT * FROM keymaps").fetchall()],
+                    "config": {r['key']: row['value'] for row in con.execute("SELECT key, value FROM config").fetchall()},
+                    "proxies": [dict(row) for row in con.execute("SELECT * FROM proxies").fetchall()],
+                    "local_stock": [dict(row) for row in con.execute("SELECT * FROM local_stock").fetchall()],
+                    "generated_at": get_vn_time()
+                }
+        with open(AUTO_BACKUP_FILE, 'w', encoding='utf-8') as f: json.dump(data, f, ensure_ascii=False, indent=2)
+    except: pass
 
 def auto_backup_loop():
-    print("INFO: Auto Backup Service đã bắt đầu (Chu kỳ: 60 phút).")
     while True:
-        time.sleep(3600) # 60 phút = 3600 giây
+        time.sleep(3600)
         perform_backup_to_file()
 
 def start_auto_backup():
     global auto_backup_started
     if not auto_backup_started:
         auto_backup_started = True
-        t = threading.Thread(target=auto_backup_loop, daemon=True)
-        t.start()
+        threading.Thread(target=auto_backup_loop, daemon=True).start()
 
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
-#
-#   PHẦN 6: LOGIC XỬ LÝ KHO HÀNG & GỌI API (STOCK LOGIC)
-#
-# ------------------------------------------------------------------------------
+# 6. LOGIC XỬ LÝ KHO HÀNG & GỌI API (STOCK LOGIC)
 # ==============================================================================
 
-# --- 1. XỬ LÝ LOCAL STOCK (KHO THỦ CÔNG) ---
 def get_local_stock_count(group_name):
-    """
-    Đếm số lượng hàng tồn kho trong bảng Local Stock theo tên Group.
-    """
-    with db() as con:
-        count = con.execute("SELECT COUNT(*) FROM local_stock WHERE group_name=?", (group_name,)).fetchone()[0]
-    return count
+    with db() as con: return con.execute("SELECT COUNT(*) FROM local_stock WHERE group_name=?", (group_name,)).fetchone()[0]
 
 def fetch_local_stock(group_name, qty):
-    """
-    Lấy hàng từ Local Stock theo số lượng yêu cầu.
-    QUAN TRỌNG: Hàng sau khi lấy sẽ bị XÓA VĨNH VIỄN khỏi Database để tránh bán trùng.
-    """
     products = []
     with db_lock:
         with db() as con:
-            # Lấy N dòng đầu tiên
             rows = con.execute("SELECT id, content FROM local_stock WHERE group_name=? LIMIT ?", (group_name, qty)).fetchall()
             if not rows: return []
-            
-            ids_to_delete = [r['id'] for r in rows]
-            
-            # Xóa ngay lập tức các dòng đã lấy
-            con.execute(f"DELETE FROM local_stock WHERE id IN ({','.join(['?']*len(ids_to_delete))})", ids_to_delete)
+            ids = [r['id'] for r in rows]
+            con.execute(f"DELETE FROM local_stock WHERE id IN ({','.join(['?']*len(ids))})", ids)
             con.commit()
-            
-            for r in rows:
-                products.append({"product": r['content']})
+            for r in rows: products.append({"product": r['content']})
     return products
 
-# --- 2. XỬ LÝ API MAIL72H (VÀ CÁC API TƯƠNG TỰ) ---
 def _mail72h_collect_all_products(obj):
-    """Helper để parse JSON trả về từ API Mail72h"""
     all_products = []
     if not isinstance(obj, dict): return None
     categories = obj.get('categories')
@@ -659,71 +380,47 @@ def _mail72h_collect_all_products(obj):
     return all_products
 
 def mail72h_format_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
-    """Gửi request mua hàng đến API đối tác"""
     data = {"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}
     url = f"{base_url.rstrip('/')}/api/buy_product"
-    # Sử dụng Proxy hiện tại đang active
     r = requests.post(url, data=data, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET) 
     r.raise_for_status()
     return r.json()
 
 def mail72h_format_product_list(base_url: str, api_key: str) -> dict:
-    """Gửi request lấy danh sách sản phẩm (để check tồn kho)"""
     params = {"api_key": api_key}
     url = f"{base_url.rstrip('/')}/api/products.php"
-    # Sử dụng Proxy hiện tại đang active
     r = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET)
     r.raise_for_status()
     return r.json()
 
 def stock_mail72h_format(row):
-    """Logic kiểm tra tồn kho cho API Mail72h"""
-    for retry_count in range(2): 
+    for _ in range(2): 
         try:
             base_url = row['base_url'] 
             pid_to_find_str = str(row["product_id"])
             list_data = mail72h_format_product_list(base_url, row["api_key"])
-            
-            if list_data.get("status") != "success":
-                return jsonify({"sum": 0}), 200
-
+            if list_data.get("status") != "success": return jsonify({"sum": 0}), 200
             products = _mail72h_collect_all_products(list_data)
             if not products: return jsonify({"sum": 0}), 200
-
             stock_val = 0
             for item in products:
-                # Parse ID an toàn
                 try:
-                    item_id_str = str(int(float(str(item.get("id", 0)))))
-                except:
-                    continue
-                    
-                if item_id_str == pid_to_find_str:
-                    stock_val = int(item.get("amount", 0))
-                    break
-            
+                    if str(int(float(str(item.get("id", 0))))) == pid_to_find_str:
+                        stock_val = int(item.get("amount", 0))
+                        break
+                except: continue
             return jsonify({"sum": stock_val})
-        
         except requests.exceptions.ProxyError:
-            print("STOCK: Proxy lỗi. Đang thử đổi proxy khác...")
-            switch_to_next_live_proxy()
-            continue
-        except Exception as e:
-            print(f"STOCK ERROR: {e}")
-            return jsonify({"sum": 0}), 200
-            
+            switch_to_next_live_proxy(); continue
+        except: return jsonify({"sum": 0}), 200
     return jsonify({"sum": 0}), 200
 
 def fetch_mail72h_format(row, qty):
-    """Logic mua hàng cho API Mail72h"""
-    for retry_count in range(2): 
+    for _ in range(2): 
         try:
             base_url = row['base_url']
             res = mail72h_format_buy(base_url, row["api_key"], int(row["product_id"]), qty)
-            
-            if res.get("status") != "success":
-                return jsonify([]), 200
-
+            if res.get("status") != "success": return jsonify([]), 200
             data = res.get("data")
             out = []
             if isinstance(data, list):
@@ -733,26 +430,15 @@ def fetch_mail72h_format(row, qty):
             else:
                 val = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
                 out = [{"product": val} for _ in range(qty)]
-            
             return jsonify(out)
-            
         except requests.exceptions.ProxyError:
-            print("FETCH: Proxy lỗi. Đang thử đổi proxy khác...")
-            switch_to_next_live_proxy()
-            continue
-        except Exception as e:
-            print(f"FETCH ERROR: {e}")
-            return jsonify([]), 200
-            
+            switch_to_next_live_proxy(); continue
+        except: return jsonify([]), 200
     return jsonify([]), 200
 
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
-#
-#   PHẦN 7: HTML TEMPLATES (GIAO DIỆN CHI TIẾT - BUNG CODE)
-#
-# ------------------------------------------------------------------------------
+# 7. HTML TEMPLATES (GIAO DIỆN CHI TIẾT - BUNG CODE)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -779,7 +465,6 @@ LOGIN_TPL = """
             --space-gradient-end: #20204a;
             --star-color: #e0e0e0;
         }
-        
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
             color: var(--text-dark);
@@ -792,7 +477,6 @@ LOGIN_TPL = """
             position: relative;
             overflow: hidden;
         }
-        
         .login-container {
             width: 100%;
             max-width: 400px;
@@ -804,14 +488,12 @@ LOGIN_TPL = """
             z-index: 10;
             text-align: left; 
         }
-        
         .header-info {
             display: flex;
             align-items: center;
             margin-bottom: 30px;
             flex-wrap: wrap;
         }
-        
         .logo {
             width: 40px;
             height: 40px;
@@ -827,40 +509,21 @@ LOGIN_TPL = """
             font-weight: bold;
             box-shadow: 0 0 10px rgba(90, 125, 255, 0.5);
         }
-        
         .title-group {
             flex-grow: 1;
             line-height: 1.3;
         }
-        
-        .title-group p {
-            margin: 0;
-            font-size: 14px;
-            color: var(--text-light);
-        }
-        
         h1 {
             font-size: 28px;
             font-weight: 700;
             color: var(--text-dark);
             margin: 0 0 10px 0;
         }
-        
         .subtitle {
             font-size: 14px;
             color: var(--text-light);
             margin-bottom: 25px;
         }
-        
-        label {
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--text-dark);
-            margin-bottom: 10px;
-            display: block;
-            text-align: left;
-        }
-        
         input {
             width: 100%;
             padding: 14px 16px;
@@ -873,13 +536,11 @@ LOGIN_TPL = """
             transition: border-color .2s, box-shadow .2s;
             font-size: 16px;
         }
-        
         input:focus {
             border-color: var(--primary);
             box-shadow: 0 0 0 3px rgba(90, 125, 255, 0.25);
             outline: none;
         }
-        
         button {
             width: 100%;
             padding: 15px 16px;
@@ -896,12 +557,10 @@ LOGIN_TPL = """
             justify-content: center;
             align-items: center;
         }
-        
         button:hover {
             opacity: 0.9;
             transform: translateY(-1px);
         }
-        
         .flash-alert {
             padding: 12px;
             margin-bottom: 20px;
@@ -911,7 +570,6 @@ LOGIN_TPL = """
             border-color: #f5c2c7;
             color: #842029;
         }
-        
         #space-background {
             position: fixed;
             top: 0;
@@ -922,7 +580,6 @@ LOGIN_TPL = """
             overflow: hidden;
             z-index: 0;
         }
-        
         .star {
             position: absolute;
             background-color: var(--star-color);
@@ -931,7 +588,6 @@ LOGIN_TPL = """
             animation: twinkle 5s infinite ease-in-out;
             z-index: 0;
         }
-        
         @keyframes twinkle {
             0%, 100% { opacity: 0; transform: scale(0.5); }
             50% { opacity: 1; transform: scale(1.2); }
@@ -944,7 +600,7 @@ LOGIN_TPL = """
     <div class="header-info">
         <div class="logo">∞</div>
         <div class="title-group">
-            <p style="font-size: 16px; font-weight: 600; color: var(--text-dark);">QUANTUM SECURITY GATE</p>
+            <p style="font-size: 16px; font-weight: 600;">QUANTUM SECURITY GATE</p>
         </div>
     </div>
 
@@ -960,12 +616,8 @@ LOGIN_TPL = """
     {% endwith %}
     
     <form method="post" action="{{ url_for('login') }}">
-        <label for="admin_secret">Mật khẩu Admin</label>
         <input type="password" id="admin_secret" name="admin_secret" placeholder="Nhập mật khẩu..." required autofocus>
-        <button type="submit">
-            🚀 
-            <span style="margin-left: 8px;">Truy Cập</span>
-        </button>
+        <button type="submit">🚀 Truy Cập</button>
     </form>
 </div>
 
@@ -1030,7 +682,7 @@ ADMIN_TPL = """
         --primary: #0d6efd; 
         --green: #198754; 
         --red: #dc3545; 
-        --blue: #0d6efd;
+        --blue: #0d6efd; 
         --gray: #6c757d;
         --shadow: 0 4px 12px rgba(0,0,0,0.05);
         
@@ -1562,7 +1214,7 @@ ADMIN_TPL = """
             <button type="submit" class="btn green" style="width: 100%; margin-top: 15px;">⬆️ Up Hàng Vào Kho</button>
         </form>
         
-        <h4 style="margin-top: 25px; border-bottom: 1px solid var(--border); padding-bottom: 5px;">Thống Kê Kho</h4>
+        <h4 style="margin-top: 25px; border-bottom: 1px solid var(--border); padding-bottom: 5px;">Thống Kê Tồn Kho</h4>
         <div style="max-height: 250px; overflow-y: auto;">
             {% for g, c in local_stats.items() %}
             <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed var(--border);">
@@ -1669,8 +1321,11 @@ ADMIN_TPL = """
     </div>
   </div>
 
-  <div style="text-align: center; color: var(--text-light); margin-top: 20px; font-size: 12px;">
-      Quantum Gate System &copy; 2024 | Developed for MMO Automation
+  <div style="text-align: center; color: var(--text-light); margin-top: 20px; font-size: 13px;">
+      Bản quyền thuộc về <strong style="color: var(--primary);">Admin Văn Linh</strong>
+      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 512 512" fill="#3a86ff" style="vertical-align: -2px; margin-left: 3px;">
+          <path d="M256 0C114.6 0 0 114.6 0 256s114.6 256 256 256 256-114.6 256-256S397.4 0 256 0zM371.8 211.8l-128 128C238.3 345.3 231.2 348 224 348s-14.3-2.7-19.8-8.2l-64-64c-10.9-10.9-10.9-28.7 0-39.6 10.9-10.9 28.7-10.9 39.6 0l44.2 44.2 108.2-108.2c10.9-10.9 28.7-10.9 39.6 0 10.9 10.9 10.9 28.7 0 39.6z"/>
+      </svg>
   </div>
 
 </div> 
@@ -2173,15 +1828,10 @@ def admin_index():
             if provider not in grouped_data[folder][provider]:
                  grouped_data[folder][provider] = [] # Sửa lại thành List để loop
             
-            # Logic cũ của bạn có thể khác, ở đây tôi gom theo:
-            # Website (Folder) -> Provider -> List Keys
-            # Nhưng template đang loop provider,keys. Vậy cấu trúc dict sẽ là:
-            # grouped_data[folder][provider] = [key1, key2...]
-            
+            # Logic gom nhóm: Website (Folder) -> Provider -> List Keys
             if isinstance(grouped_data[folder][provider], list):
                  grouped_data[folder][provider].append(key)
             else:
-                 # Fallback nếu có lỗi logic cũ
                  grouped_data[folder][provider] = [key]
         
         # 2. Lấy danh sách Proxy (Để hiển thị bảng)
@@ -2528,7 +2178,7 @@ def health():
 # ------------------------------------------------------------------------------
 # ==============================================================================
 
-# QUAN TRỌNG: Chạy init_db() ngay khi file được import (để Gunicorn chạy nó)
+# QUAN TRỌNG: Chạy init_db() ngay khi file được import (để Gunicorn trên Render chạy nó)
 print("INFO: Đang khởi tạo Database...")
 init_db() 
 
