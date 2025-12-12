@@ -1949,16 +1949,28 @@ def check_tiktok_single(line, proxy_iter):
             'Referer': 'https://www.tiktok.com/'
         }
         
-        # Timeout ngắn để tăng tốc độ (5s)
-        r = requests.get(url, headers=headers, proxies=formatted_proxy, timeout=5)
+        # Timeout tăng lên 10s cho chắc ăn
+        r = requests.get(url, headers=headers, proxies=formatted_proxy, timeout=10)
         
-        # LOGIC CHECK: 200 = LIVE, 404 = DIE
+        # --- LOGIC MỚI SỬA: CHECK NỘI DUNG ĐỂ PHÂN BIỆT LIVE/DIE ---
+        
         if r.status_code == 200:
-            return ("LIVE", line, "OK")
+            # TikTok trả về 200 cả khi acc die (soft 404) hoặc captcha.
+            # Acc LIVE chắc chắn có "followerCount" (số follow) hoặc "user-detail" trong source HTML
+            
+            if "captcha" in r.text.lower() or "verify" in r.text.lower():
+                return ("DIE", line, "Captcha/Verify")
+                
+            if '"followerCount":' in r.text or "user-detail" in r.text:
+                return ("LIVE", line, "OK")
+            else:
+                # 200 OK nhưng không có info -> Acc Die hoặc Page Not Found
+                return ("DIE", line, "Not Found/No Info")
+
         elif r.status_code == 404:
             return ("DIE", line, "404 Not Found")
         else:
-            return ("DIE", line, f"Status Code {r.status_code}") # Các lỗi khác coi như DIE hoặc chặn
+            return ("DIE", line, f"Status {r.status_code}")
             
     except Exception as e:
         return ("DIE", line, "Error/Timeout")
