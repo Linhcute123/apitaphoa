@@ -5,7 +5,7 @@ import datetime
 import threading
 import time
 import random
-import re # MỚI: Import để xử lý Regex làm sạch dòng chữ DIE/LIVE
+import re # Import module xử lý chuỗi (Regex)
 from urllib.parse import quote 
 from contextlib import closing
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string, flash, make_response
@@ -1522,7 +1522,7 @@ TIKTOK_RESULT_TPL = """
         body { background: #121212; color: #e9ecef; font-family: monospace; padding: 20px; }
         .box { background: #1c1c1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; position: relative; }
         h2 { color: #5a7dff; margin-top: 0; }
-        textarea { width: 100%; background: #2c2c2e; border: 1px solid #333; padding: 10px; height: 300px; font-family: monospace; }
+        textarea { width: 100%; background: #2c2c2e; border: 1px solid #333; padding: 10px; height: 300px; font-family: monospace; color: #eee; }
         .stats { display: flex; gap: 20px; font-size: 18px; margin-bottom: 10px; }
         .live { color: #20c997; font-weight: bold; }
         .die { color: #dc3545; font-weight: bold; }
@@ -1944,25 +1944,30 @@ def check_tiktok_live_status(tiktok_id):
             'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
         }
         
-        # Tăng timeout lên một chút để tránh lỗi mạng
-        r = requests.get(url, headers=headers, proxies=proxies, timeout=10)
+        # Tăng timeout lên một chút để tránh lỗi mạng. 
+        # allow_redirects=True để xem có bị redirect sang trang not found hay không.
+        r = requests.get(url, headers=headers, proxies=proxies, timeout=15, allow_redirects=True)
         
+        # --- LOGIC CHECK SIÊU AN TOÀN ---
+        
+        # Nếu Status Code là 404 -> CHẮC CHẮN DIE
+        if r.status_code == 404:
+            return "DIE"
+
         content = r.text
 
-        # CÁC DẤU HIỆU NHẬN BIẾT ACC DIE CHUẨN XÁC:
+        # CÁC DẤU HIỆU NHẬN BIẾT ACC DIE CHUẨN XÁC TRONG CONTENT:
+        # Chỉ check 2 dòng text đặc trưng này. Acc trắng sẽ không có dòng này.
         if "Không thể tìm thấy tài khoản này" in content:
             return "DIE"
         if "Couldn't find this account" in content:
             return "DIE"
-        if "user-not-found" in content: # Class CSS thường thấy khi die
-            return "DIE"
 
-        # Nếu không tìm thấy các dòng trên -> Acc LIVE (hoặc bị Captcha, cứ cho là LIVE)
+        # Nếu không tìm thấy các dòng trên -> Acc LIVE (hoặc acc trắng, hoặc bị Captcha, cứ cho là LIVE)
         return "LIVE"
 
     except Exception as e:
         # Lỗi mạng, lỗi Proxy -> Trả về LIVE để giữ lại acc check sau
-        # print(f"Lỗi check {tiktok_id}: {e}")
         return "LIVE"
 
 @app.route("/admin/tiktok/check", methods=["POST"])
