@@ -5,7 +5,7 @@ import datetime
 import threading
 import time
 import random
-import re # Import module xử lý chuỗi (Regex)
+import re
 from urllib.parse import quote 
 from contextlib import closing
 from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string, flash, make_response
@@ -34,7 +34,7 @@ AUTO_BACKUP_FILE = "auto_backup.json"
 # 1.3 Cấu hình Bảo mật & Ứng dụng
 # ------------------------------------------------------------------------------
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
-DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "5")) 
+DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "10")) 
 PROXY_CHECK_INTERVAL = 15 
 
 # Khởi tạo ứng dụng Flask.
@@ -504,7 +504,7 @@ def fetch_mail72h_format(row, qty):
 # ==============================================================================
 # ==============================================================================
 #
-#   PHẦN 7: HTML TEMPLATES
+#   PHẦN 7: HTML TEMPLATES (GIAO DIỆN)
 #
 # ==============================================================================
 # ==============================================================================
@@ -930,14 +930,14 @@ ADMIN_TPL = """
 
   <div class="card">
     <h3>6. TikTok Checker Tool</h3>
-    <form method="post" action="{{ url_for('admin_tiktok_checker') }}">
+    <form method="post" action="{{ url_for('admin_tiktok_checker_page') }}">
         <div class="row">
             <div class="col-12">
                 <label>Nhập List Cần Check (Mỗi dòng 1 ID hoặc user|pass... - Hệ thống tự lấy cột 1 làm ID)</label>
                 <textarea name="tiktok_list" rows="5" class="mono" placeholder="tiktok_id_1&#10;tiktok_id_2|pass..." required></textarea>
             </div>
             <div class="col-12">
-                <button type="submit" class="btn green" style="width: 100%; margin-top: 10px;">🔍 Check Live/Die Ngay</button>
+                <button type="submit" class="btn green" style="width: 100%; margin-top: 10px;">🚀 Chạy Check Live/Die</button>
             </div>
         </div>
     </form>
@@ -1510,75 +1510,149 @@ HISTORY_VIEW_TPL = """
 """
 
 # ------------------------------------------------------------------------------
-# 7.5 MỚI: TEMPLATE KẾT QUẢ TIKTOK CHECKER (ĐÃ SỬA THEO YÊU CẦU)
+# 7.5 MỚI: TEMPLATE TIKTOK PROGRESS RUNNING (REAL-TIME UI)
 # ------------------------------------------------------------------------------
-TIKTOK_RESULT_TPL = """
+TIKTOK_PROGRESS_TPL = """
 <!doctype html>
 <html data-theme="dark">
 <head>
     <meta charset="utf-8" />
-    <title>Kết Quả Check TikTok</title>
+    <title>Checker Running...</title>
     <style>
         body { background: #121212; color: #e9ecef; font-family: monospace; padding: 20px; }
-        .box { background: #1c1c1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; position: relative; }
-        h2 { color: #5a7dff; margin-top: 0; }
-        textarea { width: 100%; background: #2c2c2e; border: 1px solid #333; padding: 10px; height: 300px; font-family: monospace; color: #eee; }
-        .stats { display: flex; gap: 20px; font-size: 18px; margin-bottom: 10px; }
-        .live { color: #20c997; font-weight: bold; }
-        .die { color: #dc3545; font-weight: bold; }
-        .live-area { color: #20c997; }
-        .die-area { color: #f07167; }
-        
-        .copy-btn {
-            background: #5a7dff; color: white; border: none; padding: 5px 10px; border-radius: 4px; 
-            cursor: pointer; font-size: 14px; margin-left: 10px; font-weight: bold;
-        }
-        .copy-btn:hover { opacity: 0.9; }
+        .header { display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }
+        .stats-bar { background: #1c1c1e; padding: 15px; border-radius: 8px; border: 1px solid #333; font-size: 18px; display: flex; align-items: center; gap: 20px; }
+        .live-txt { color: #20c997; font-weight: bold; }
+        .die-txt { color: #dc3545; font-weight: bold; }
+        .box { background: #1c1c1e; padding: 15px; border-radius: 8px; border: 1px solid #333; margin-top: 20px; }
+        textarea { width: 100%; background: #2c2c2e; border: 1px solid #333; padding: 10px; height: 300px; font-family: monospace; color: #eee; box-sizing: border-box; }
+        button { background: #5a7dff; color: white; border: none; padding: 5px 10px; cursor: pointer; margin-left: 10px; border-radius: 4px; font-weight: bold; }
+        a { color: #5a7dff; text-decoration: none; }
+        .icon-check { color: #20c997; margin-right: 5px; }
+        .rocket { font-size: 20px; }
     </style>
-    <script>
-        function copyToClipboard(elementId) {
-            var copyText = document.getElementById(elementId);
-            copyText.select();
-            copyText.setSelectionRange(0, 99999); 
-            navigator.clipboard.writeText(copyText.value).then(function() {
-                alert("Đã copy thành công!");
-            }, function(err) {
-                alert("Lỗi copy: " + err);
-            });
-        }
-    </script>
 </head>
 <body>
-    <h2>🔍 Kết Quả Check TikTok</h2>
-    <a href="{{ url_for('admin_index') }}" style="color:#5a7dff; text-decoration:none;">🔙 Quay lại Dashboard</a>
-    <br><br>
+    <h2 class="header"><span class="rocket">🚀</span> <span id="main-title">Checker Running...</span></h2>
     
-    <div class="stats">
-        <span class="live">✅ LIVE: {{ live_count }}</span>
-        <span class="die">❌ DIE: {{ die_count }}</span>
+    <div class="stats-bar">
+        <span id="status-icon" style="color: #ffc107;">⏳</span>
+        <span>Checked: <span id="cnt">0</span></span>
+        <span style="color:#444">|</span>
+        <span class="live-txt">LIVE: <span id="live">0</span></span>
+        <span style="color:#444">|</span>
+        <span class="die-txt">DIE: <span id="die">0</span></span>
     </div>
 
     <div class="box">
-        <h3 class="live">DANH SÁCH LIVE <button class="copy-btn" onclick="copyToClipboard('live_area')">Copy LIVE</button></h3>
-        <textarea id="live_area" class="live-area" readonly>{{ live_content }}</textarea>
+        <h3 class="live-txt">
+            <span class="icon-check">✅</span> DANH SÁCH LIVE (Copy tại đây)
+            <button onclick="copy('live_area')">COPY LIVE</button>
+        </h3>
+        <textarea id="live_area" readonly></textarea>
     </div>
 
     <div class="box">
-        <h3 class="die">DANH SÁCH DIE <button class="copy-btn" onclick="copyToClipboard('die_area')">Copy DIE</button></h3>
-        <textarea id="die_area" class="die-area" readonly>{{ die_content }}</textarea>
+        <h3 class="die-txt">
+            <span style="margin-right:5px">❌</span> DANH SÁCH DIE / LỖI
+            <button onclick="copy('die_area')" style="background:#dc3545">COPY DIE</button>
+        </h3>
+        <textarea id="die_area" readonly></textarea>
     </div>
 
+    <div style="margin-top: 20px;">
+        <a href="{{ url_for('admin_index') }}">🔙 Quay lại Dashboard</a>
+    </div>
+
+    <textarea id="raw_input" style="display:none;">{{ raw_list }}</textarea>
+
+    <script>
+        const raw = document.getElementById('raw_input').value;
+        const lines = raw.split('\\n').filter(line => line.trim() !== '');
+        let total = lines.length;
+        let processed = 0;
+        let liveCount = 0;
+        let dieCount = 0;
+        
+        const liveArea = document.getElementById('live_area');
+        const dieArea = document.getElementById('die_area');
+        
+        // Hàng đợi xử lý
+        let queue = [...lines];
+
+        function updateStats() {
+            document.getElementById('cnt').innerText = processed + '/' + total;
+            document.getElementById('live').innerText = liveCount;
+            document.getElementById('die').innerText = dieCount;
+            
+            if (processed >= total) {
+                document.getElementById('main-title').innerText = "ĐÃ CHECK XONG!";
+                document.getElementById('status-icon').innerText = "✅";
+                document.getElementById('status-icon').style.color = "#20c997";
+            }
+        }
+
+        async function checkLine(line) {
+            try {
+                const formData = new FormData();
+                formData.append('line', line);
+                
+                const res = await fetch('/admin/tiktok/check-api', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await res.json();
+                
+                if (data.status === 'LIVE') {
+                    liveCount++;
+                    liveArea.value += data.clean_line + '\\n';
+                } else {
+                    dieCount++;
+                    dieArea.value += data.clean_line + '\\n';
+                }
+            } catch (err) {
+                // Lỗi mạng coi như LIVE để an toàn
+                liveCount++;
+                liveArea.value += line + '\\n';
+            } finally {
+                processed++;
+                updateStats();
+                // Check tiếp nếu còn hàng đợi
+                if (queue.length > 0) {
+                    checkLine(queue.shift());
+                }
+            }
+        }
+
+        window.onload = function() {
+            updateStats();
+            // Chạy 5 luồng (thread) song song để check nhanh hơn
+            const CONCURRENCY = 5;
+            let initialBatch = Math.min(CONCURRENCY, queue.length);
+            for (let i = 0; i < initialBatch; i++) {
+                checkLine(queue.shift());
+            }
+        };
+
+        function copy(id) {
+            var t = document.getElementById(id); 
+            t.select(); 
+            navigator.clipboard.writeText(t.value); 
+            alert("Đã copy vào bộ nhớ đệm!");
+        }
+    </script>
 </body>
 </html>
 """
 
 
 # ==============================================================================
-# ------------------------------------------------------------------------------
+# ==============================================================================
 #
 #   PHẦN 8: FLASK ROUTES & CONTROLLERS (XỬ LÝ REQUEST)
 #
-# ------------------------------------------------------------------------------
+# ==============================================================================
 # ==============================================================================
 
 def find_map_by_key(key: str):
@@ -1927,114 +2001,78 @@ def admin_local_stock_clear():
     return redirect(url_for("admin_index") + "#local-stock")
 
 # ------------------------------------------------------------------------------
-# MỚI: ROUTE TIKTOK CHECKER
+# MỚI: ROUTE TIKTOK CHECKER (LOGIC MỚI & API)
 # ------------------------------------------------------------------------------
+
 def check_tiktok_live_status(tiktok_id):
     """
-    Check theo nội dung trang web:
-    - Chỉ báo DIE khi trong HTML có chuỗi báo lỗi "Không thể tìm thấy..."
-    - Còn lại trả về LIVE (bao gồm cả lỗi mạng, proxy, captcha... thà báo nhầm là Live còn hơn xóa nhầm acc ngon)
+    Check chuẩn: 
+    - DIE: Nếu server trả 404 hoặc nội dung HTML chứa chữ "Không tìm thấy".
+    - LIVE: Mọi trường hợp còn lại (Acc trắng, lỗi mạng, lỗi proxy, captcha...) -> để an toàn.
     """
     url = f"https://www.tiktok.com/@{tiktok_id}"
     proxies = CURRENT_PROXY_SET
     try:
-        # Thêm Accept-Language để TikTok ưu tiên trả về tiếng Việt/Anh để dễ bắt key
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
             'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7'
         }
+        # allow_redirects=True để xem có bị redirect sang trang not found hay không
+        r = requests.get(url, headers=headers, proxies=proxies, timeout=10, allow_redirects=True)
         
-        # Tăng timeout lên một chút để tránh lỗi mạng. 
-        # allow_redirects=True để xem có bị redirect sang trang not found hay không.
-        r = requests.get(url, headers=headers, proxies=proxies, timeout=15, allow_redirects=True)
-        
-        # --- LOGIC CHECK SIÊU AN TOÀN ---
-        
-        # Nếu Status Code là 404 -> CHẮC CHẮN DIE
+        # 1. Check Status Code
         if r.status_code == 404:
             return "DIE"
 
+        # 2. Check Content (Dành cho trường hợp 200 OK nhưng nội dung là Not Found)
         content = r.text
-
-        # CÁC DẤU HIỆU NHẬN BIẾT ACC DIE CHUẨN XÁC TRONG CONTENT:
-        # Chỉ check 2 dòng text đặc trưng này. Acc trắng sẽ không có dòng này.
-        if "Không thể tìm thấy tài khoản này" in content:
-            return "DIE"
         if "Couldn't find this account" in content:
             return "DIE"
-
-        # Nếu không tìm thấy các dòng trên -> Acc LIVE (hoặc acc trắng, hoặc bị Captcha, cứ cho là LIVE)
+        if "Không thể tìm thấy tài khoản này" in content:
+            return "DIE"
+            
+        # Còn lại LIVE
+        return "LIVE"
+    except:
+        # Lỗi mạng -> LIVE (An toàn)
         return "LIVE"
 
-    except Exception as e:
-        # Lỗi mạng, lỗi Proxy -> Trả về LIVE để giữ lại acc check sau
-        return "LIVE"
+@app.route("/admin/tiktok/check-page", methods=["POST"])
+def admin_tiktok_checker_page():
+    # Route này chỉ để render giao diện Progress
+    if request.cookies.get("logged_in") != ADMIN_SECRET: return abort(403)
+    raw_list = request.form.get("tiktok_list", "")
+    return render_template_string(TIKTOK_PROGRESS_TPL, raw_list=raw_list)
 
-@app.route("/admin/tiktok/check", methods=["POST"])
-def admin_tiktok_checker():
-    require_admin()
-    raw_list = request.form.get("tiktok_list", "").strip()
+@app.route("/admin/tiktok/check-api", methods=["POST"])
+def admin_tiktok_check_api():
+    # Route này xử lý từng dòng acc do Javascript gửi lên
+    if request.cookies.get("logged_in") != ADMIN_SECRET: return abort(403)
+    line = request.form.get("line", "").strip()
+    if not line: return jsonify({"status": "LIVE", "clean_line": ""})
+
+    # 1. Làm sạch dòng (Xóa [DIE], [LIVE], Not Found...)
+    clean_line = re.sub(r'^\[(DIE|LIVE)\]\s*', '', line)
+    clean_line = clean_line.replace('(Not Found)', '').strip()
+
+    # 2. Tách ID để check
+    # Tách bằng | hoặc khoảng trắng, lấy phần tử đầu tiên
+    parts = clean_line.split('|') if '|' in clean_line else clean_line.split()
+    tiktok_id = parts[0].strip()
+
+    status = "LIVE"
+    if tiktok_id:
+        status = check_tiktok_live_status(tiktok_id)
+
+    # 3. Lưu lịch sử
+    try:
+        with db() as con:
+             con.execute("INSERT INTO tiktok_history(input_line, tiktok_id, status, checked_at) VALUES(?,?,?,?)", (clean_line, tiktok_id, status, get_vn_time()))
+             con.commit()
+    except: pass
     
-    if not raw_list:
-        flash("Vui lòng nhập danh sách cần check!", "error")
-        return redirect(url_for("admin_index"))
-
-    lines = raw_list.split('\n')
-    live_lines = []
-    die_lines = []
-    
-    live_count = 0
-    die_count = 0
-    
-    with db() as con:
-        # Xóa lịch sử cũ hơn 5 ngày
-        con.execute("DELETE FROM tiktok_history WHERE checked_at < date('now', '-5 days')")
-        
-        now = get_vn_time()
-        
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-
-            # --- BƯỚC 1: LÀM SẠCH (CLEAN) DỮ LIỆU ĐẦU VÀO ---
-            # Xóa [DIE], [LIVE] ở đầu dòng nếu có
-            clean_line = re.sub(r'^\[(DIE|LIVE)\]\s*', '', line)
-            # Xóa (Not Found) ở cuối dòng nếu có
-            clean_line = clean_line.replace('(Not Found)', '').strip()
-
-            # --- BƯỚC 2: TÁCH TIKTOK ID ---
-            # Tách bằng | hoặc khoảng trắng
-            if "|" in clean_line:
-                parts = clean_line.split('|')
-            else:
-                parts = clean_line.split()
-            
-            tiktok_id = parts[0].strip()
-            if not tiktok_id: continue
-            
-            # --- BƯỚC 3: CHECK STATUS ---
-            status = check_tiktok_live_status(tiktok_id)
-            
-            # Lưu DB (Lưu dòng gốc để đối chiếu nếu cần)
-            con.execute("INSERT INTO tiktok_history(input_line, tiktok_id, status, checked_at) VALUES(?,?,?,?)", (clean_line, tiktok_id, status, now))
-            
-            if status == "LIVE":
-                live_count += 1
-                live_lines.append(clean_line) # Chỉ thêm dòng sạch vào list kết quả
-            else:
-                die_count += 1
-                die_lines.append(clean_line)  # Chỉ thêm dòng sạch vào list kết quả
-        
-        con.commit()
-
-    live_content = "\n".join(live_lines)
-    die_content = "\n".join(die_lines)
-    
-    return render_template_string(TIKTOK_RESULT_TPL, 
-                                  live_count=live_count, 
-                                  die_count=die_count, 
-                                  live_content=live_content,
-                                  die_content=die_content)
+    # Trả về kết quả JSON để JS cập nhật giao diện
+    return jsonify({"status": status, "clean_line": clean_line})
 
 
 # ------------------------------------------------------------------------------
@@ -2072,7 +2110,7 @@ def admin_delete_proxy():
 # ------------------------------------------------------------------------------
 # ROUTES: QUẢN LÝ PING (ANTI-SLEEP)
 # ------------------------------------------------------------------------------
-@app.route("/admin/ping/save", methods=["POST"])
+@app.route("/admin/save-ping", methods=["POST"])
 def admin_save_ping():
     require_admin()
     url = request.form.get("ping_url", "").strip()
