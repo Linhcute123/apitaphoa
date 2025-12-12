@@ -5,16 +5,17 @@ import datetime
 import threading
 import time
 import random
-from urllib.parse import quote # MỚI: Import để xử lý tên file tiếng Việt
+import concurrent.futures
+import itertools
+from urllib.parse import quote
 from contextlib import closing
-from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string, flash, make_response
+from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string, flash, make_response, stream_with_context, Response
 import requests
 
 # ==============================================================================
 # ==============================================================================
 #
 #   PHẦN 1: CẤU HÌNH HỆ THỐNG (SYSTEM CONFIGURATION)
-#   Thiết lập các biến môi trường và hằng số quan trọng.
 #
 # ==============================================================================
 # ==============================================================================
@@ -235,13 +236,13 @@ def init_db():
 def format_proxy_url(proxy_string: str) -> dict:
     if not proxy_string:
         return {"http": None, "https": None}
-    parts = proxy_string.split(':')
+    parts = proxy_string.strip().split(':')
     formatted_proxy = ""
     if len(parts) == 2:
         ip, port = parts
         formatted_proxy = f"http://{ip}:{port}"
-    elif len(parts) == 4:
-        ip, port, user, passwd = parts
+    elif len(parts) >= 4: # Hỗ trợ user:pass
+        ip, port, user, passwd = parts[0], parts[1], parts[2], parts[3]
         formatted_proxy = f"http://{user}:{passwd}@{ip}:{port}"
     else:
         return {"http": None, "https": None}
@@ -861,8 +862,8 @@ ADMIN_TPL = """
             <div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed var(--border); align-items: center;">
                 <span><b style="color: var(--primary);">{{ g }}</b>: <span style="background: var(--input-bg); padding: 2px 6px; border-radius: 4px;">{{ c }} items</span></span>
                 <div style="display: flex; gap: 5px; align-items: center;">
-                    <input type="number" id="q_{{g}}" value="1" style="width: 60px; padding: 4px; margin: 0; height: 28px;" min="1">
-                    <button class="btn green small" style="height: 28px; line-height: 1;" onclick="quickGet('{{g}}')">⚡ Lấy & Copy</button>
+                    <input type="number" id="q_{{g}}" value="1" style="width: 60px; padding: 4px; margin: 0; height: 28px;" min="1" title="Nhập số lượng cần lấy">
+                    <button class="btn green small" style="height: 28px; line-height: 1;" onclick="quickGet('{{g}}')">⚡ Lấy</button>
                     
                     <a href="{{ url_for('admin_local_stock_view', group=g) }}" class="btn blue small" style="height: 28px; display: flex; align-items: center;">Xem</a>
                     <form action="{{ url_for('admin_local_stock_clear') }}" method="post" style="display: inline;" onsubmit="return confirm('XÓA SẠCH kho {{g}}?');"><input type="hidden" name="group_name" value="{{ g }}"><button class="btn red small" style="height: 28px;">Xóa</button></form>
@@ -929,38 +930,24 @@ ADMIN_TPL = """
   </div>
 
   <div class="card">
-    <h3>6. TikTok Checker Tool</h3>
-    <form method="post" action="{{ url_for('admin_tiktok_checker') }}">
+    <h3 style="color: #ffc107;">6. TikTok Checker Tool (Max Speed - Multi-Thread)</h3>
+    <form method="post" action="{{ url_for('admin_run_checker') }}" target="_blank">
         <div class="row">
-            <div class="col-12">
-                <label>Nhập List Cần Check (Mỗi dòng 1 ID hoặc user|pass... - Hệ thống tự lấy cột 1 làm ID)</label>
-                <textarea name="tiktok_list" rows="5" class="mono" placeholder="tiktok_id_1&#10;tiktok_id_2|pass..." required></textarea>
+            <div class="col-8">
+                <label>Nhập List Cần Check (Mỗi dòng 1 ID hoặc user|pass... - Lấy cột 1 làm ID)</label>
+                <textarea name="check_list" rows="6" class="mono" placeholder="tiktok_id_1&#10;tiktok_id_2|pass..." required></textarea>
             </div>
-            <div class="col-12">
-                <button type="submit" class="btn green" style="width: 100%; margin-top: 10px;">🔍 Check Live/Die Ngay</button>
+            <div class="col-4">
+                <label>Danh Sách Proxy Check (Tùy chọn)</label>
+                <textarea name="check_proxies" rows="3" class="mono" placeholder="ip:port:user:pass&#10;Mỗi dòng 1 cái..."></textarea>
+                
+                <label style="margin-top: 10px;">Số Luồng (Threads)</label>
+                <input type="number" name="threads" value="10" min="1" max="100" class="mono">
+
+                <button type="submit" class="btn green" style="width: 100%; margin-top: 15px;">🚀 Bắt Đầu Check</button>
             </div>
         </div>
     </form>
-    
-    <details style="margin-top: 15px; border-top: 1px dashed var(--border); padding-top: 10px;">
-        <summary style="cursor: pointer; color: var(--blue);">📜 Lịch sử Check (5 ngày gần nhất)</summary>
-        <div style="max-height: 300px; overflow-y: auto; margin-top: 10px;">
-            <table style="margin: 0;">
-                <thead><tr><th>ID</th><th>Status</th><th>Time</th></tr></thead>
-                <tbody>
-                {% for h in tiktok_history %}
-                    <tr>
-                        <td class="mono" style="font-size: 12px;">{{ h.tiktok_id }}</td>
-                        <td style="font-weight: bold; color: {{ 'var(--green)' if h.status=='LIVE' else 'var(--red)' }};">{{ h.status }}</td>
-                        <td style="font-size: 11px;">{{ h.checked_at }}</td>
-                    </tr>
-                {% else %}
-                    <tr><td colspan="3" style="text-align: center;">Chưa có lịch sử.</td></tr>
-                {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </details>
   </div>
 
   <div class="card" style="padding: 20px;">
@@ -1007,7 +994,7 @@ async function quickGet(group) {
                 alert("Kho hết hàng hoặc không đủ số lượng!");
                 return;
             }
-            // Auto Copy
+            // Auto Copy (Vẫn giữ chức năng copy nhưng đổi thông báo)
             await navigator.clipboard.writeText(text);
             alert(`✅ Đã lấy ${qty} acc và COPY vào clipboard thành công!`);
             location.reload();
@@ -1319,7 +1306,7 @@ function createEffectCanvas(id) {
 """
 
 # ------------------------------------------------------------------------------
-# 7.3 TEMPLATE XEM CHI TIẾT KHO HÀNG (STOCK_VIEW_TPL) - CÓ SEARCH & DEDUP & DOWNLOAD
+# 7.3 TEMPLATE XEM CHI TIẾT KHO HÀNG (STOCK_VIEW_TPL) - CÓ CHECK LIVE
 # ------------------------------------------------------------------------------
 STOCK_VIEW_TPL = """
 <!doctype html>
@@ -1388,6 +1375,7 @@ STOCK_VIEW_TPL = """
             display: flex;
             gap: 10px;
             margin-bottom: 15px;
+            align-items: center;
         }
         
         input[type="text"] {
@@ -1416,6 +1404,12 @@ STOCK_VIEW_TPL = """
     
     <div class="tools-bar">
         <a href="{{ url_for('admin_index') }}#local-stock">🔙 Quay lại Dashboard</a>
+        
+        <form action="{{ url_for('admin_run_checker') }}" method="post" target="_blank" style="margin: 0;">
+            <input type="hidden" name="local_group" value="{{ group }}">
+            <button type="submit" style="background: #3a86ff; color: #fff;">🔍 Check Live (TikTok)</button>
+        </form>
+
         <form method="get" style="margin-left: auto;">
             <input type="hidden" name="group" value="{{ group }}">
             <input type="text" name="q" placeholder="Tìm kiếm acc..." value="{{ request.args.get('q', '') }}">
@@ -1461,7 +1455,7 @@ STOCK_VIEW_TPL = """
 """
 
 # ------------------------------------------------------------------------------
-# 7.4 TEMPLATE LỊCH SỬ LẤY HÀNG (HISTORY_VIEW_TPL - MỚI)
+# 7.4 TEMPLATE LỊCH SỬ LẤY HÀNG (HISTORY_VIEW_TPL)
 # ------------------------------------------------------------------------------
 HISTORY_VIEW_TPL = """
 <!doctype html>
@@ -1510,42 +1504,69 @@ HISTORY_VIEW_TPL = """
 """
 
 # ------------------------------------------------------------------------------
-# 7.5 MỚI: TEMPLATE KẾT QUẢ TIKTOK CHECKER
+# 7.5 MỚI: TEMPLATE STREAM CHECKER (HIỂN THỊ TIẾN TRÌNH & KẾT QUẢ)
 # ------------------------------------------------------------------------------
-TIKTOK_RESULT_TPL = """
+CHECKER_STREAM_TPL = """
 <!doctype html>
 <html data-theme="dark">
 <head>
     <meta charset="utf-8" />
-    <title>Kết Quả Check TikTok</title>
+    <title>Checker Progress</title>
     <style>
         body { background: #121212; color: #e9ecef; font-family: monospace; padding: 20px; }
-        .box { background: #1c1c1e; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #333; }
-        h2 { color: #5a7dff; margin-top: 0; }
-        textarea { width: 100%; background: #2c2c2e; color: #20c997; border: 1px solid #333; padding: 10px; height: 300px; }
-        .stats { display: flex; gap: 20px; font-size: 18px; margin-bottom: 10px; }
+        .stats { display: flex; gap: 20px; font-size: 20px; margin-bottom: 20px; border: 1px solid #333; padding: 15px; border-radius: 8px; background: #1c1c1e; }
         .live { color: #20c997; font-weight: bold; }
         .die { color: #dc3545; font-weight: bold; }
+        .unknown { color: #ffc107; }
+        .box { margin-top: 20px; }
+        textarea { width: 100%; background: #2c2c2e; color: #fff; border: 1px solid #333; padding: 10px; min-height: 150px; font-family: monospace; }
+        h3 { border-bottom: 1px solid #333; padding-bottom: 5px; }
+        .die-item { font-size: 12px; border-bottom: 1px dashed #333; padding: 3px 0; }
     </style>
 </head>
 <body>
-    <h2>🔍 Kết Quả Check TikTok</h2>
-    <a href="{{ url_for('admin_index') }}" style="color:#5a7dff; text-decoration:none;">🔙 Quay lại Dashboard</a>
-    <br><br>
-    
+    <h2>🚀 Checker Running...</h2>
     <div class="stats">
-        <span class="live">✅ LIVE: {{ live_count }}</span>
-        <span class="die">❌ DIE: {{ die_count }}</span>
+        <span id="p-total">Total: 0</span> | 
+        <span class="live" id="p-live">LIVE: 0</span> | 
+        <span class="die" id="p-die">DIE: 0</span>
+    </div>
+    <div id="status-msg" style="color: #adb5bd; margin-bottom: 10px;">Đang khởi tạo luồng...</div>
+    
+    <div class="box">
+        <h3 class="live">✅ DANH SÁCH LIVE (Copy tại đây)</h3>
+        <textarea id="live-area" readonly></textarea>
+    </div>
+    
+    <div class="box">
+        <h3 class="die">❌ CHI TIẾT LỖI / DIE</h3>
+        <div id="die-list" style="max-height: 300px; overflow-y: auto; color: #aaa; border: 1px solid #333; padding: 10px; background: #1a1a1a;"></div>
     </div>
 
-    <div class="box">
-        <h3 class="live">DANH SÁCH LIVE (Đã lọc)</h3>
-        <p>Copy danh sách bên dưới:</p>
-        <textarea readonly>{{ live_content }}</textarea>
-    </div>
-</body>
-</html>
-"""
+    <script>
+        function updateCount(total, live, die) {
+            document.getElementById('p-total').innerText = 'Checked: ' + total;
+            document.getElementById('p-live').innerText = 'LIVE: ' + live;
+            document.getElementById('p-die').innerText = 'DIE: ' + die;
+        }
+        function addLive(line) {
+            let area = document.getElementById('live-area');
+            area.value += line + "\\n";
+        }
+        function addDie(line, reason) {
+            let div = document.getElementById('die-list');
+            let item = document.createElement('div');
+            item.className = 'die-item';
+            item.innerHTML = `<span style="color:#f07167">[DIE]</span> ${line} <em style="color:#666">(${reason})</em>`;
+            div.appendChild(item);
+        }
+        function done() {
+            document.getElementById('status-msg').innerText = "✅ ĐÃ CHECK XONG!";
+            document.getElementById('status-msg').style.color = "#20c997";
+            document.getElementById('status-msg').style.fontWeight = "bold";
+        }
+    </script>
+    """
 
 
 # ==============================================================================
@@ -1603,8 +1624,7 @@ def admin_index():
         # 1. Lấy danh sách Keymaps
         maps = con.execute("SELECT * FROM keymaps ORDER BY group_name, provider_type, sku, id").fetchall()
         
-        # Gom nhóm dữ liệu: Website -> Provider -> Key List
-        # SỬ DỤNG LIST ĐỂ ĐẢM BẢO HIỂN THỊ ĐỦ TẤT CẢ KEY
+        # Gom nhóm dữ liệu
         grouped_data = {}
         for key in maps:
             folder = key['group_name'] or 'DEFAULT' 
@@ -1614,11 +1634,11 @@ def admin_index():
                 grouped_data[folder] = {}
             
             if provider not in grouped_data[folder]:
-                grouped_data[folder][provider] = [] # Khởi tạo là List
+                grouped_data[folder][provider] = [] 
             
-            grouped_data[folder][provider].append(key) # Append vào list
+            grouped_data[folder][provider].append(key)
         
-        # 2. Lấy danh sách Proxy (Để hiển thị bảng)
+        # 2. Lấy danh sách Proxy
         proxies = con.execute("SELECT * FROM proxies ORDER BY is_live DESC, latency ASC").fetchall()
 
         # 3. Lấy cấu hình Ping
@@ -1636,9 +1656,6 @@ def admin_index():
         # Tạo danh sách group để gợi ý input
         local_groups = [r['group_name'] for r in stock_rows]
 
-        # 5. MỚI: Lấy lịch sử TikTok (50 dòng mới nhất)
-        tiktok_history = con.execute("SELECT * FROM tiktok_history ORDER BY id DESC LIMIT 50").fetchall()
-
     # Lấy setting giao diện từ Cookie
     effect = request.cookies.get('admin_effect', 'astronaut')
     mode = request.cookies.get('admin_mode', 'dark') 
@@ -1650,7 +1667,6 @@ def admin_index():
                                   ping=ping_config, 
                                   local_stats=local_stats,
                                   local_groups=local_groups,
-                                  tiktok_history=tiktok_history,
                                   effect=effect,
                                   mode=mode)
 
@@ -1674,7 +1690,6 @@ def admin_add_keymap():
         flash("Lỗi: Thiếu thông tin bắt buộc.", "error")
         return redirect(url_for("admin_index"))
     
-    # FIX: Nếu local thì id = 0, để tránh lỗi
     if provider_type == 'local': 
         product_id = 0
         
@@ -1699,7 +1714,6 @@ def admin_add_keymap():
         
     return redirect(url_for("admin_index"))
 
-# NEW: Route xử lý thêm key hàng loạt cho Local
 @app.route("/admin/keymap/bulk", methods=["POST"])
 def admin_add_keymap_bulk():
     require_admin()
@@ -1796,11 +1810,10 @@ def admin_local_stock_add():
 def admin_local_stock_view():
     require_admin()
     grp = request.args.get("group")
-    query = request.args.get("q", "").strip() # Lấy từ khóa tìm kiếm
+    query = request.args.get("q", "").strip() 
     
     with db() as con:
         if query:
-            # Tìm kiếm gần đúng (LIKE)
             items = con.execute("SELECT * FROM local_stock WHERE group_name=? AND content LIKE ?", (grp, f"%{query}%")).fetchall()
         else:
             items = con.execute("SELECT * FROM local_stock WHERE group_name=?", (grp,)).fetchall()
@@ -1814,23 +1827,20 @@ def admin_local_stock_download():
     with db() as con:
         rows = con.execute("SELECT content FROM local_stock WHERE group_name=?", (grp,)).fetchall()
     
-    # Xuất ra file .txt, mỗi dòng là 1 content
     out = "\n".join([r['content'] for r in rows])
     resp = make_response(out)
     
-    # FIX: Tên file tiếng Việt
     filename = f"stock_{grp}.txt"
     try:
         encoded_filename = quote(filename)
         resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded_filename}"
     except:
-        # Fallback nếu lỗi encode
         resp.headers["Content-Disposition"] = f"attachment; filename=stock_download.txt"
         
     resp.headers["Content-Type"] = "text/plain; charset=utf-8"
     return resp
 
-# MỚI: ROUTE LẤY NHANH HÀNG (AJAX)
+# ROUTE LẤY NHANH HÀNG (AJAX) - Đã sửa nút thành "Lấy"
 @app.route("/admin/local-stock/quick-get")
 def admin_local_stock_quick_get():
     require_admin()
@@ -1866,7 +1876,6 @@ def admin_local_stock_dedup():
     require_admin()
     grp = request.form.get("group_name")
     with db() as con:
-        # Xóa các dòng trùng lặp, chỉ giữ lại dòng có ID nhỏ nhất
         con.execute("""
             DELETE FROM local_stock 
             WHERE group_name=? 
@@ -1902,82 +1911,128 @@ def admin_local_stock_clear():
     return redirect(url_for("admin_index") + "#local-stock")
 
 # ------------------------------------------------------------------------------
-# MỚI: ROUTE TIKTOK CHECKER
+# MỚI: HỆ THỐNG CHECKER ĐA LUỒNG + PROXY + STREAMING
 # ------------------------------------------------------------------------------
-def check_tiktok_live_status(tiktok_id):
-    """
-    Check đơn giản: 
-    - Nếu request trả về 200 và không bị redirect đến 404 -> LIVE
-    - Nếu 404 -> DIE
-    """
+
+def check_tiktok_single(line, proxy_iter):
+    """ Hàm check 1 dòng, trả về (status, line, reason) """
+    line = line.strip()
+    if not line: return None
+    
+    # Tách ID: Hỗ trợ "user|pass" hoặc "user"
+    if "|" in line:
+        parts = line.split('|')
+        tiktok_id = parts[0].strip()
+    else:
+        parts = line.split()
+        tiktok_id = parts[0].strip()
+    
+    if not tiktok_id: return None
+    
+    # Tạo URL TikTok Check theo yêu cầu: tiktok.com/@<id>
     url = f"https://www.tiktok.com/@{tiktok_id}"
-    proxies = CURRENT_PROXY_SET
+    
+    # Lấy Proxy từ vòng lặp (nếu có)
+    current_proxy = None
+    if proxy_iter:
+        try:
+            current_proxy = next(proxy_iter)
+        except: pass
+    
+    formatted_proxy = format_proxy_url(current_proxy) if current_proxy else CURRENT_PROXY_SET
+    
     try:
-        # Giả lập Header để tránh bị chặn ngay lập tức
+        # Header giả lập để tránh bị chặn
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.tiktok.com/'
         }
-        r = requests.get(url, headers=headers, proxies=proxies, timeout=8)
         
+        # Timeout ngắn để tăng tốc độ (5s)
+        r = requests.get(url, headers=headers, proxies=formatted_proxy, timeout=5)
+        
+        # LOGIC CHECK: 200 = LIVE, 404 = DIE
         if r.status_code == 200:
-            return "LIVE"
+            return ("LIVE", line, "OK")
         elif r.status_code == 404:
-            return "DIE"
+            return ("DIE", line, "404 Not Found")
         else:
-            return "DIE" # Các trường hợp lỗi khác coi như DIE để an toàn
-    except:
-        return "DIE"
+            return ("DIE", line, f"Status Code {r.status_code}") # Các lỗi khác coi như DIE hoặc chặn
+            
+    except Exception as e:
+        return ("DIE", line, "Error/Timeout")
 
-@app.route("/admin/tiktok/check", methods=["POST"])
-def admin_tiktok_checker():
+@app.route("/admin/checker/run", methods=["POST"])
+def admin_run_checker():
     require_admin()
-    raw_list = request.form.get("tiktok_list", "").strip()
     
-    if not raw_list:
-        flash("Vui lòng nhập danh sách cần check!", "error")
-        return redirect(url_for("admin_index"))
-
-    lines = raw_list.split('\n')
-    live_lines = []
-    live_count = 0
-    die_count = 0
+    # 1. Lấy dữ liệu input
+    raw_list = request.form.get("check_list", "")
+    local_group = request.form.get("local_group", "") # Nếu check từ local stock
+    raw_proxies = request.form.get("check_proxies", "").strip()
     
-    with db() as con:
-        # Xóa lịch sử cũ hơn 5 ngày
-        con.execute("DELETE FROM tiktok_history WHERE checked_at < date('now', '-5 days')")
+    try:
+        threads = int(request.form.get("threads", 10))
+    except:
+        threads = 10
         
-        now = get_vn_time()
+    lines = []
+    
+    # 2. Xử lý nguồn dữ liệu (Text area hoặc Local DB)
+    if local_group:
+        with db() as con:
+            rows = con.execute("SELECT content FROM local_stock WHERE group_name=?", (local_group,)).fetchall()
+            lines = [r['content'] for r in rows]
+    else:
+        lines = [l for l in raw_list.splitlines() if l.strip()]
         
-        for line in lines:
-            line = line.strip()
-            if not line: continue
-            
-            # Lấy cột 1 làm ID
-            # Tách bằng | hoặc khoảng trắng
-            if "|" in line:
-                parts = line.split('|')
-            else:
-                parts = line.split()
-            
-            tiktok_id = parts[0].strip()
-            if not tiktok_id: continue
-            
-            # Check Status
-            status = check_tiktok_live_status(tiktok_id)
-            
-            # Lưu DB
-            con.execute("INSERT INTO tiktok_history(input_line, tiktok_id, status, checked_at) VALUES(?,?,?,?)", (line, tiktok_id, status, now))
-            
-            if status == "LIVE":
-                live_count += 1
-                live_lines.append(line) # Giữ nguyên dòng gốc
-            else:
-                die_count += 1
-        
-        con.commit()
+    if not lines:
+        return "Không có dữ liệu để check.", 400
 
-    live_content = "\n".join(live_lines)
-    return render_template_string(TIKTOK_RESULT_TPL, live_count=live_count, die_count=die_count, live_content=live_content)
+    # 3. Xử lý Proxy List (Tạo iterator quay vòng)
+    proxy_list = [p.strip() for p in raw_proxies.splitlines() if p.strip()]
+    proxy_iter = itertools.cycle(proxy_list) if proxy_list else None
+
+    # 4. Generator Function để Stream kết quả về Browser
+    def generate_check_result():
+        yield CHECKER_STREAM_TPL # Gửi header HTML trước
+        
+        total_checked = 0
+        live_count = 0
+        die_count = 0
+        
+        # Sử dụng ThreadPoolExecutor để chạy đa luồng
+        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+            # Submit tất cả task
+            futures = {executor.submit(check_tiktok_single, line, proxy_iter): line for line in lines}
+            
+            # Khi mỗi task hoàn thành
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result:
+                    status, line, reason = result
+                    total_checked += 1
+                    
+                    if status == "LIVE":
+                        live_count += 1
+                        # Gửi JS để update UI Live
+                        safe_line = json.dumps(line)
+                        yield f"<script>addLive({safe_line});</script>\n"
+                    else:
+                        die_count += 1
+                        # Gửi JS để update UI Die
+                        safe_line = json.dumps(line)
+                        safe_reason = json.dumps(reason)
+                        yield f"<script>addDie({safe_line}, {safe_reason});</script>\n"
+                    
+                    # Update Counter liên tục
+                    yield f"<script>updateCount({total_checked}, {live_count}, {die_count});</script>\n"
+                    
+        # Kết thúc
+        yield "<script>done();</script></body></html>"
+
+    return Response(stream_with_context(generate_check_result()))
 
 
 # ------------------------------------------------------------------------------
