@@ -1915,11 +1915,13 @@ def admin_local_stock_clear():
 # ------------------------------------------------------------------------------
 
 def check_tiktok_single(line, proxy_iter):
-    """ Hàm check 1 dòng, trả về (status, line, reason) """
+    """ 
+    Hàm check TikTok Live/Die - Phiên bản Fix Captcha & Logic
+    """
     line = line.strip()
     if not line: return None
     
-    # Tách ID: Hỗ trợ "user|pass" hoặc "user"
+    # Tách ID: Hỗ trợ định dạng "user|pass" hoặc "user"
     if "|" in line:
         parts = line.split('|')
         tiktok_id = parts[0].strip()
@@ -1927,12 +1929,15 @@ def check_tiktok_single(line, proxy_iter):
         parts = line.split()
         tiktok_id = parts[0].strip()
     
+    # Xử lý ID: Xóa @ nếu có để tránh lỗi URL
+    tiktok_id = tiktok_id.replace("@", "")
+    
     if not tiktok_id: return None
     
-    # Tạo URL TikTok Check theo yêu cầu: tiktok.com/@<id>
+    # Tạo URL chuẩn
     url = f"https://www.tiktok.com/@{tiktok_id}"
     
-    # Lấy Proxy từ vòng lặp (nếu có)
+    # Lấy Proxy (nếu có)
     current_proxy = None
     if proxy_iter:
         try:
@@ -1942,37 +1947,50 @@ def check_tiktok_single(line, proxy_iter):
     formatted_proxy = format_proxy_url(current_proxy) if current_proxy else CURRENT_PROXY_SET
     
     try:
-        # Header giả lập để tránh bị chặn
+        # Header giả lập Chrome Windows thật để tránh WAF
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
             'Referer': 'https://www.tiktok.com/'
         }
         
-        # Timeout tăng lên 10s cho chắc ăn
-        r = requests.get(url, headers=headers, proxies=formatted_proxy, timeout=10)
+        # Timeout 8s là đủ
+        r = requests.get(url, headers=headers, proxies=formatted_proxy, timeout=8)
         
-        # --- LOGIC MỚI SỬA: CHECK NỘI DUNG ĐỂ PHÂN BIỆT LIVE/DIE ---
+        html_content = r.text
         
-        if r.status_code == 200:
-            # TikTok trả về 200 cả khi acc die (soft 404) hoặc captcha.
-            # Acc LIVE chắc chắn có "followerCount" (số follow) hoặc "user-detail" trong source HTML
-            
-            if "captcha" in r.text.lower() or "verify" in r.text.lower():
-                return ("DIE", line, "Captcha/Verify")
-                
-            if '"followerCount":' in r.text or "user-detail" in r.text:
-                return ("LIVE", line, "OK")
-            else:
-                # 200 OK nhưng không có info -> Acc Die hoặc Page Not Found
-                return ("DIE", line, "Not Found/No Info")
+        # --- LOGIC PHÂN LOẠI CHÍNH XÁC ---
 
-        elif r.status_code == 404:
+        # 1. Trường hợp DIE rõ ràng (404 hoặc thông báo không tìm thấy)
+        if r.status_code == 404:
             return ("DIE", line, "404 Not Found")
-        else:
-            return ("DIE", line, f"Status {r.status_code}")
+        
+        if "Couldn't find this account" in html_content or "user-not-found" in html_content:
+            return ("DIE", line, "Not Found")
+
+        # 2. Trường hợp bị CAPTCHA / WAF chặn (Trả về 200 nhưng không hiện profile)
+        if "captcha" in html_content.lower() or "verify" in html_content.lower() or "waf" in html_content.lower():
+            return ("DIE", line, "Bị Chặn/Captcha")
+
+        # 3. Trường hợp LIVE (Phải tìm thấy dữ liệu user)
+        # Tìm chuỗi followerCount (số follow) hoặc uniqueId trong JSON ẩn của TikTok
+        if '"followerCount":' in html_content or '"uniqueId":' in html_content or '"secUid":' in html_content:
+            return ("LIVE", line, "OK")
+            
+        # 4. Trường hợp còn lại (200 OK nhưng không có dữ liệu -> DIE hoặc Lỗi lạ)
+        return ("DIE", line, "No Data/Check Fail")
             
     except Exception as e:
+        # Lỗi kết nối/Timeout -> DIE
         return ("DIE", line, "Error/Timeout")
 
 @app.route("/admin/checker/run", methods=["POST"])
