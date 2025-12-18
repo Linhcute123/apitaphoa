@@ -1,16 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-PROJECT: QUANTUM GATE - ULTIMATE TIKTOK MANAGER & CHECKER
-VERSION: 7.0 (Integrated Logic from checktiktok_patched.py)
-AUTHOR: Admin Van Linh
-DATE: 2025-12-12
-
-DESCRIPTION:
-    - Web Server Flask quản lý kho hàng và check TikTok.
-    - Tích hợp thuật toán check Live/Die chuẩn xác từ tool Python máy tính.
-    - Hỗ trợ đa luồng, Proxy xoay vòng, Giao diện tối ưu.
-"""
-
 import os
 import json
 import sqlite3
@@ -18,642 +5,1752 @@ import datetime
 import threading
 import time
 import random
-import concurrent.futures
-import itertools
-import re
-from urllib.parse import quote
-from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string, flash, make_response, stream_with_context, Response
+from contextlib import closing
+from flask import Flask, request, jsonify, abort, redirect, url_for, render_template_string, flash, make_response
 import requests
 
-# Import BeautifulSoup để check chuẩn như file bạn gửi
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
-    print("WARNING: Cần cài đặt thư viện 'beautifulsoup4' để check chuẩn xác nhất.")
-
 # ==============================================================================
-#   PHẦN 1: CẤU HÌNH HỆ THỐNG
+# ==============================================================================
+#
+#   PHẦN 1: CẤU HÌNH HỆ THỐNG (SYSTEM CONFIGURATION)
+#   Thiết lập các biến môi trường và hằng số quan trọng.
+#
+# ==============================================================================
 # ==============================================================================
 
+# ------------------------------------------------------------------------------
+# 1.1 Cấu hình Database
+# ------------------------------------------------------------------------------
+# Đường dẫn đến file Database SQLite.
 DB = os.getenv("DB_PATH", "store.db") 
-SECRET_BACKUP_FILE_PATH = os.getenv("SECRET_BACKUP_FILE_PATH", "/etc/secrets/backupapitaphoa.json")
-AUTO_BACKUP_FILE = "auto_backup.json"
-ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
-DEFAULT_TIMEOUT = 15 # Tăng timeout để check kỹ hơn
-PROXY_CHECK_INTERVAL = 20 
 
+# ------------------------------------------------------------------------------
+# 1.2 Cấu hình Backup & Restore
+# ------------------------------------------------------------------------------
+# Đường dẫn đến file Secret Backup trên Render
+SECRET_BACKUP_FILE_PATH = os.getenv("SECRET_BACKUP_FILE_PATH", "/etc/secrets/backupapitaphoa.json")
+# Tên file backup tự động sinh ra
+AUTO_BACKUP_FILE = "auto_backup.json"
+
+# ------------------------------------------------------------------------------
+# 1.3 Cấu hình Bảo mật & Ứng dụng
+# ------------------------------------------------------------------------------
+# Mật khẩu quản trị viên (Admin Secret).
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "CHANGE_ME")
+
+# Thời gian chờ (Timeout) mặc định cho các request API ra ngoài.
+DEFAULT_TIMEOUT = int(os.getenv("DEFAULT_TIMEOUT", "5")) 
+
+# Thời gian (giây) giữa các lần kiểm tra Proxy tự động.
+PROXY_CHECK_INTERVAL = 15 
+
+# Khởi tạo ứng dụng Flask.
 app = Flask(__name__)
 app.secret_key = ADMIN_SECRET 
 
-CURRENT_PROXY_SET = {"http": None, "https": None}
+# ------------------------------------------------------------------------------
+# 1.4 Biến toàn cục (Global Variables)
+# ------------------------------------------------------------------------------
+# Biến lưu trữ cấu hình Proxy đang hoạt động.
+CURRENT_PROXY_SET = {
+    "http": None, 
+    "https": None
+}
 CURRENT_PROXY_STRING = "" 
+
+# Khóa thread (Mutex) để tránh xung đột khi nhiều luồng cùng ghi vào Database.
 db_lock = threading.Lock()
 
+# Cờ kiểm soát trạng thái các luồng chạy ngầm.
 proxy_checker_started = False
 ping_service_started = False
 auto_backup_started = False
 
-# User-Agent từ file checktiktok_patched.py
-UA_STRING = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-
 
 # ==============================================================================
-#   PHẦN 2: DATABASE & UTILS
+# ==============================================================================
+#
+#   PHẦN 2: TIỆN ÍCH THỜI GIAN (TIMEZONE UTILS)
+#   Xử lý thời gian để hiển thị đúng giờ Việt Nam.
+#
+# ==============================================================================
 # ==============================================================================
 
 def get_vn_time():
+    """
+    Hàm lấy thời gian hiện tại theo múi giờ Việt Nam (UTC+7).
+    """
+    # Lấy giờ UTC hiện tại
     utc_now = datetime.datetime.utcnow()
+    # Cộng thêm 7 giờ để chuyển sang giờ Việt Nam
     vn_now = utc_now + datetime.timedelta(hours=7)
+    # Trả về chuỗi đã định dạng
     return vn_now.strftime("%Y-%m-%d %H:%M:%S")
 
+
+# ==============================================================================
+# ==============================================================================
+#
+#   PHẦN 3: CÁC HÀM XỬ LÝ DATABASE (DB UTILS)
+#   Bao gồm kết nối, khởi tạo bảng, migration và auto restore.
+#
+# ==============================================================================
+# ==============================================================================
+
 def db():
+    """Tạo kết nối mới đến Database SQLite."""
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row 
     return con
 
 def _ensure_col(con, table, col, decl):
-    try: con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-    except: pass
+    """Hàm phụ trợ để đảm bảo một cột tồn tại trong bảng."""
+    try:
+        query = f"ALTER TABLE {table} ADD COLUMN {col} {decl}"
+        con.execute(query)
+    except Exception:
+        pass
 
 def init_db():
+    """
+    Hàm khởi tạo Database quan trọng nhất.
+    """
     with db_lock:
         with db() as con:
-            print(f"INFO: Đang khởi tạo Database tại: {DB}")
-            # Tạo các bảng
-            con.execute("CREATE TABLE IF NOT EXISTS keymaps(id INTEGER PRIMARY KEY AUTOINCREMENT, sku TEXT NOT NULL, input_key TEXT NOT NULL UNIQUE, product_id INTEGER NOT NULL, is_active INTEGER DEFAULT 1, group_name TEXT, provider_type TEXT NOT NULL DEFAULT 'mail72h', base_url TEXT, api_key TEXT)")
-            con.execute("CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT)")
-            con.execute("CREATE TABLE IF NOT EXISTS proxies(id INTEGER PRIMARY KEY AUTOINCREMENT, proxy_string TEXT NOT NULL UNIQUE, is_live INTEGER DEFAULT 0, latency REAL DEFAULT 9999.0, last_checked TEXT)")
-            con.execute("CREATE TABLE IF NOT EXISTS local_stock(id INTEGER PRIMARY KEY AUTOINCREMENT, group_name TEXT NOT NULL, content TEXT NOT NULL, added_at TEXT)")
-            con.execute("CREATE TABLE IF NOT EXISTS local_history(id INTEGER PRIMARY KEY AUTOINCREMENT, group_name TEXT NOT NULL, content TEXT NOT NULL, fetched_at TEXT)")
+            print(f"INFO: Đang kết nối và khởi tạo Database tại: {DB}")
             
-            # Migration
+            # TẠO BẢNG KEYMAPS
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS keymaps(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sku TEXT NOT NULL,
+                    input_key TEXT NOT NULL UNIQUE,
+                    product_id INTEGER NOT NULL,
+                    is_active INTEGER DEFAULT 1,
+                    group_name TEXT,
+                    provider_type TEXT NOT NULL DEFAULT 'mail72h',
+                    base_url TEXT,
+                    api_key TEXT
+                )
+            """)
+            
+            # TẠO BẢNG CONFIG
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS config(
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            
+            # TẠO BẢNG PROXIES
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS proxies(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    proxy_string TEXT NOT NULL UNIQUE, 
+                    is_live INTEGER DEFAULT 0,
+                    latency REAL DEFAULT 9999.0, 
+                    last_checked TEXT
+                )
+            """)
+            
+            # TẠO BẢNG LOCAL STOCK
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS local_stock(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    added_at TEXT
+                )
+            """)
+
+            # TẠO BẢNG LOCAL HISTORY
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS local_history(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_name TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    fetched_at TEXT
+                )
+            """)
+            
+            # MIGRATION: Cập nhật cấu trúc bảng
             _ensure_col(con, "keymaps", "group_name", "TEXT")
-            _ensure_col(con, "keymaps", "provider_type", "TEXT")
+            _ensure_col(con, "keymaps", "provider_type", "TEXT NOT NULL DEFAULT 'mail72h'")
             _ensure_col(con, "keymaps", "base_url", "TEXT")
             _ensure_col(con, "keymaps", "api_key", "TEXT")
             
-            # Seed Data
+            try: con.execute("ALTER TABLE keymaps DROP COLUMN note")
+            except: pass
+            
+            try: con.execute("ALTER TABLE keymaps RENAME COLUMN mail72h_api_key TO api_key")
+            except: pass
+            
+            # KHỞI TẠO DỮ LIỆU MẶC ĐỊNH
+            con.execute("DELETE FROM config WHERE key='current_proxy_string'")
             con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("selected_proxy_string", ""))
             con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("ping_url", ""))
             con.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", ("ping_interval", "300"))
             
             con.commit()
+
+            # LOGIC AUTO RESTORE (KHÔI PHỤC DỮ LIỆU TỰ ĐỘNG)
+            keymap_count = con.execute("SELECT COUNT(*) FROM keymaps").fetchone()[0]
             
-            # Auto Restore
-            if con.execute("SELECT COUNT(*) FROM keymaps").fetchone()[0] == 0:
+            if keymap_count == 0:
+                print("WARNING: Database đang trống. Đang tìm kiếm file Backup bí mật...")
+                
                 if SECRET_BACKUP_FILE_PATH and os.path.exists(SECRET_BACKUP_FILE_PATH):
                     try:
                         with open(SECRET_BACKUP_FILE_PATH, 'r', encoding='utf-8') as f:
                             data = json.load(f)
-                        kms = data.get('keymaps', []) if isinstance(data, dict) else data
-                        for k in kms:
-                            con.execute("INSERT OR IGNORE INTO keymaps(sku, input_key, product_id, is_active, group_name, provider_type, base_url, api_key) VALUES(?,?,?,?,?,?,?,?)", 
-                                       (k.get('sku'), k.get('input_key'), k.get('product_id'), k.get('is_active',1), k.get('group_name','DEFAULT'), k.get('provider_type','mail72h'), k.get('base_url'), k.get('api_key')))
+                        
+                        keymaps_to_import = []
+                        config_to_import = {}
+                        proxies_to_import = []
+                        local_stock_to_import = []
+
+                        # Kiểm tra định dạng file backup
+                        if isinstance(data, list):
+                            keymaps_to_import = data
+                        elif isinstance(data, dict):
+                            keymaps_to_import = data.get('keymaps', [])
+                            config_to_import = data.get('config', {})
+                            proxies_to_import = data.get('proxies', [])
+                            local_stock_to_import = data.get('local_stock', [])
+
+                        # Restore Keymaps
+                        for item in keymaps_to_import:
+                            con.execute("""
+                                INSERT OR IGNORE INTO keymaps(sku, input_key, product_id, is_active, group_name, provider_type, base_url, api_key) 
+                                VALUES(?,?,?,?,?,?,?,?)
+                            """, (item.get('sku'), item.get('input_key'), item.get('product_id'), item.get('is_active', 1), item.get('group_name', item.get('base_url', 'DEFAULT')), item.get('provider_type', 'mail72h'), item.get('base_url'), item.get('api_key')))
+
+                        # Restore Config
+                        for key, value in config_to_import.items():
+                            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, str(value)))
+                        
+                        # Restore Proxies
+                        for item in proxies_to_import:
+                            con.execute("INSERT OR IGNORE INTO proxies (proxy_string, is_live, latency, last_checked) VALUES (?, ?, ?, ?)", (item.get('proxy_string'), item.get('is_live', 0), item.get('latency', 9999.0), get_vn_time()))
+                            
+                        # Restore Local Stock
+                        for item in local_stock_to_import:
+                            con.execute("INSERT INTO local_stock (group_name, content, added_at) VALUES (?, ?, ?)", (item.get('group_name'), item.get('content'), item.get('added_at')))
+                        
                         con.commit()
-                        print("SUCCESS: Auto-restored data.")
+                        print(f"SUCCESS: Đã khôi phục dữ liệu thành công từ Secret File!")
                     except Exception as e:
-                        print(f"ERROR: Restore failed: {e}")
+                        print(f"ERROR: Khôi phục thất bại. Lỗi chi tiết: {e}")
+                else:
+                    print(f"ERROR: Không tìm thấy file backup tại {SECRET_BACKUP_FILE_PATH}")
+            else:
+                 print("INFO: Database đã có dữ liệu. Bỏ qua bước khôi phục tự động.")
 
 
 # ==============================================================================
-#   PHẦN 3: PROXY MANAGER
+# ==============================================================================
+#
+#   PHẦN 4: XỬ LÝ PROXY (PROXY UTILS)
+#
+# ==============================================================================
 # ==============================================================================
 
 def format_proxy_url(proxy_string: str) -> dict:
-    if not proxy_string: return {"http": None, "https": None}
-    parts = proxy_string.strip().split(':')
-    fmt = ""
-    if len(parts) == 2: fmt = f"http://{parts[0]}:{parts[1]}"
-    elif len(parts) >= 4: fmt = f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-    else: return {"http": None, "https": None}
-    return {"http": fmt, "https": fmt}
+    """Chuyển đổi chuỗi proxy thành dict requests."""
+    if not proxy_string:
+        return {"http": None, "https": None}
+        
+    parts = proxy_string.split(':')
+    formatted_proxy = ""
+    
+    if len(parts) == 2:
+        ip, port = parts
+        formatted_proxy = f"http://{ip}:{port}"
+    elif len(parts) == 4:
+        ip, port, user, passwd = parts
+        formatted_proxy = f"http://{user}:{passwd}@{ip}:{port}"
+    else:
+        return {"http": None, "https": None}
+        
+    return {"http": formatted_proxy, "https": formatted_proxy}
 
 def check_proxy_live(proxy_string: str) -> tuple:
-    p = format_proxy_url(proxy_string)
-    if not p.get("http"): return (0, 9999.0)
+    """Kiểm tra proxy sống hay chết."""
+    formatted_proxies = format_proxy_url(proxy_string)
+    if not formatted_proxies.get("http"):
+        return (0, 9999.0) 
+
     try:
-        s = time.time()
-        requests.get("http://www.google.com/generate_204", proxies=p, timeout=5)
-        return (1, time.time() - s)
-    except: return (0, 9999.0)
+        start_time = time.time()
+        requests.get("http://www.google.com/generate_204", 
+                     proxies=formatted_proxies, 
+                     timeout=DEFAULT_TIMEOUT * 2)
+        latency = time.time() - start_time
+        return (1, latency)
+    except Exception:
+        return (0, 9999.0)
 
 def update_proxy_state(proxy_string: str, is_live: int, latency: float):
+    """Cập nhật trạng thái proxy vào DB."""
     with db_lock:
         with db() as con:
-            con.execute("UPDATE proxies SET is_live=?, latency=?, last_checked=? WHERE proxy_string=?", (is_live, latency, get_vn_time(), proxy_string))
+            con.execute("""
+                UPDATE proxies SET is_live=?, latency=?, last_checked=?
+                WHERE proxy_string=?
+            """, (is_live, latency, get_vn_time(), proxy_string))
             con.commit()
 
-def select_best_available_proxy(con):
-    row = con.execute("SELECT proxy_string FROM proxies WHERE is_live=1 ORDER BY latency ASC LIMIT 1").fetchone()
-    ps = row['proxy_string'] if row else ""
-    set_current_proxy_by_string(ps)
-    con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", ("selected_proxy_string", ps)); con.commit()
-    return ps
-
-def set_current_proxy_by_string(ps: str):
-    global CURRENT_PROXY_SET, CURRENT_PROXY_STRING
-    CURRENT_PROXY_SET = format_proxy_url(ps)
-    CURRENT_PROXY_STRING = ps if CURRENT_PROXY_SET.get("http") else ""
+def get_proxies_from_db():
+    with db_lock:
+        with db() as con:
+            return con.execute("SELECT * FROM proxies ORDER BY is_live DESC, latency ASC").fetchall()
 
 def load_selected_proxy_from_db(con):
     row = con.execute("SELECT value FROM config WHERE key=?", ("selected_proxy_string",)).fetchone()
     return row['value'] if row else ""
 
+def set_current_proxy_by_string(proxy_string: str):
+    global CURRENT_PROXY_SET, CURRENT_PROXY_STRING
+    if not proxy_string:
+        CURRENT_PROXY_SET = {"http": None, "https": None}
+        CURRENT_PROXY_STRING = ""
+        return
+
+    formatted = format_proxy_url(proxy_string)
+    if formatted.get("http"):
+        CURRENT_PROXY_SET = formatted
+        CURRENT_PROXY_STRING = proxy_string
+    else:
+        CURRENT_PROXY_SET = {"http": None, "https": None}
+        CURRENT_PROXY_STRING = ""
+
+def select_best_available_proxy(con):
+    live_proxy = con.execute(
+        "SELECT proxy_string FROM proxies WHERE is_live=1 ORDER BY latency ASC LIMIT 1"
+    ).fetchone()
+    
+    new_proxy_string = ""
+    if live_proxy:
+        new_proxy_string = live_proxy['proxy_string']
+    
+    set_current_proxy_by_string(new_proxy_string)
+    con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", 
+                ("selected_proxy_string", new_proxy_string))
+    con.commit()
+    return new_proxy_string
+
+def switch_to_next_live_proxy():
+    with db_lock:
+        with db() as con:
+            live_proxies = con.execute("""
+                SELECT proxy_string FROM proxies 
+                WHERE is_live=1 AND proxy_string != ? 
+                ORDER BY latency ASC
+            """, (CURRENT_PROXY_STRING,)).fetchall()
+            
+            new_proxy_string = ""
+            if live_proxies:
+                new_proxy_string = live_proxies[0]['proxy_string']
+            
+            set_current_proxy_by_string(new_proxy_string)
+            con.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", 
+                        ("selected_proxy_string", new_proxy_string))
+            con.commit()
+            return new_proxy_string
+
+def run_initial_proxy_scan_and_select():
+    print("INFO: (Startup) Đang chạy quét kiểm tra proxy lần đầu...")
+    proxies = get_proxies_from_db() 
+    if not proxies:
+        return
+
+    for row in proxies:
+        proxy_string = row['proxy_string']
+        is_live, latency = check_proxy_live(proxy_string)
+        update_proxy_state(proxy_string, is_live, latency)
+        
+    with db_lock:
+        with db() as con:
+            select_best_available_proxy(con)
+
 
 # ==============================================================================
-#   PHẦN 4: BACKGROUND SERVICES
+# ==============================================================================
+#
+#   PHẦN 5: CÁC LUỒNG CHẠY NỀN (BACKGROUND THREADS)
+#
+# ==============================================================================
 # ==============================================================================
 
+# --- THREAD 1: PROXY CHECKER ---
 def proxy_checker_loop():
-    time.sleep(5)
+    print(f"INFO: Luồng Proxy Checker đã bắt đầu (Interval: {PROXY_CHECK_INTERVAL}s).")
+    time.sleep(2) 
+
     while True:
         try:
-            with db_lock:
-                with db() as con: rows = con.execute("SELECT * FROM proxies").fetchall()
-            for r in rows:
-                is_live, lat = check_proxy_live(r['proxy_string'])
-                update_proxy_state(r['proxy_string'], is_live, lat)
-                time.sleep(0.5)
-        except: pass
+            proxies = get_proxies_from_db()
+            current_proxy_still_live = False
+
+            for row in proxies:
+                proxy_string = row['proxy_string']
+                is_live, latency = check_proxy_live(proxy_string)
+                update_proxy_state(proxy_string, is_live, latency)
+                
+                if is_live and proxy_string == CURRENT_PROXY_STRING:
+                    current_proxy_still_live = True
+                
+                time.sleep(0.5) 
+
+            if CURRENT_PROXY_STRING and not current_proxy_still_live:
+                print(f"WARNING: Proxy hiện tại {CURRENT_PROXY_STRING} đã chết. Đang tìm proxy thay thế...")
+                switch_to_next_live_proxy() 
+            
+        except Exception as e:
+            print(f"PROXY_CHECKER_ERROR: {e}")
+        
         time.sleep(PROXY_CHECK_INTERVAL)
 
 def start_proxy_checker_once():
     global proxy_checker_started
     if not proxy_checker_started:
         proxy_checker_started = True
-        threading.Thread(target=proxy_checker_loop, daemon=True).start()
+        t = threading.Thread(target=proxy_checker_loop, daemon=True)
+        t.start()
 
+# --- THREAD 2: PING SERVICE (ANTI-SLEEP) ---
 def ping_loop():
+    print("INFO: Ping Service (Anti-Sleep) đã bắt đầu.")
     while True:
         try:
+            target_url = ""
+            interval = 300
+            
             with db() as con:
-                u = con.execute("SELECT value FROM config WHERE key='ping_url'").fetchone()
-                i = con.execute("SELECT value FROM config WHERE key='ping_interval'").fetchone()
-                url, inv = (u['value'] if u else ""), (int(i['value']) if i else 300)
-            if url: requests.get(url, timeout=10)
-            time.sleep(max(10, inv))
-        except: time.sleep(60)
+                r1 = con.execute("SELECT value FROM config WHERE key='ping_url'").fetchone()
+                r2 = con.execute("SELECT value FROM config WHERE key='ping_interval'").fetchone()
+                if r1: target_url = r1['value']
+                if r2: interval = int(r2['value'])
+            
+            if target_url and target_url.startswith("http"):
+                try:
+                    requests.get(target_url, timeout=10)
+                except Exception as e:
+                    print(f"PING ERROR: {e}")
+            
+            if interval < 10: interval = 10 
+            time.sleep(interval)
+        except Exception as e:
+            print(f"Ping Loop Error: {e}")
+            time.sleep(60)
 
 def start_ping_service():
     global ping_service_started
     if not ping_service_started:
         ping_service_started = True
-        threading.Thread(target=ping_loop, daemon=True).start()
+        t = threading.Thread(target=ping_loop, daemon=True)
+        t.start()
 
+# --- THREAD 3: AUTO BACKUP ---
 def perform_backup_to_file():
     try:
         with db_lock:
             with db() as con:
-                data = {
-                    "keymaps": [dict(r) for r in con.execute("SELECT * FROM keymaps").fetchall()],
-                    "config": {r['key']: r['value'] for r in con.execute("SELECT key, value FROM config").fetchall()},
-                    "proxies": [dict(r) for r in con.execute("SELECT * FROM proxies").fetchall()],
-                    "local_stock": [dict(r) for r in con.execute("SELECT * FROM local_stock").fetchall()]
-                }
-        with open(AUTO_BACKUP_FILE, 'w', encoding='utf-8') as f: json.dump(data, f)
-    except: pass
+                keymaps = [dict(row) for row in con.execute("SELECT * FROM keymaps").fetchall()]
+                config = {row['key']: row['value'] for row in con.execute("SELECT key, value FROM config").fetchall()}
+                proxies = [dict(row) for row in con.execute("SELECT * FROM proxies").fetchall()]
+                local_stock = [dict(row) for row in con.execute("SELECT * FROM local_stock").fetchall()]
+
+        backup_data = {
+            "keymaps": keymaps,
+            "config": config,
+            "proxies": proxies,
+            "local_stock": local_stock,
+            "generated_at": get_vn_time()
+        }
+        
+        with open(AUTO_BACKUP_FILE, 'w', encoding='utf-8') as f:
+            json.dump(backup_data, f, ensure_ascii=False, indent=2)
+            
+    except Exception as e:
+        print(f"AUTO BACKUP ERROR: {e}")
+
+def auto_backup_loop():
+    print("INFO: Auto Backup Service đã bắt đầu (Chu kỳ: 60 phút).")
+    while True:
+        time.sleep(3600) 
+        perform_backup_to_file()
 
 def start_auto_backup():
     global auto_backup_started
     if not auto_backup_started:
         auto_backup_started = True
-        threading.Thread(target=lambda: (time.sleep(3600), perform_backup_to_file()), daemon=True).start()
+        t = threading.Thread(target=auto_backup_loop, daemon=True)
+        t.start()
 
 
 # ==============================================================================
-#   PHẦN 5: CORE LOGIC (MAIL72H & LOCAL STOCK)
+# ==============================================================================
+#
+#   PHẦN 6: LOGIC XỬ LÝ KHO HÀNG & GỌI API (STOCK LOGIC)
+#
+# ==============================================================================
 # ==============================================================================
 
-def fetch_local_stock(group, qty):
+# --- 1. XỬ LÝ LOCAL STOCK (KHO THỦ CÔNG) ---
+def get_local_stock_count(group_name):
+    with db() as con:
+        count = con.execute("SELECT COUNT(*) FROM local_stock WHERE group_name=?", (group_name,)).fetchone()[0]
+    return count
+
+def fetch_local_stock(group_name, qty):
+    """
+    Lấy hàng từ Local Stock theo số lượng yêu cầu.
+    QUAN TRỌNG: 
+    1. Hàng sau khi lấy sẽ được lưu vào LOCAL HISTORY.
+    2. Hàng sẽ bị XÓA VĨNH VIỄN khỏi kho (Stock) để tránh bán trùng.
+    """
+    products = []
     with db_lock:
         with db() as con:
-            rows = con.execute("SELECT id, content FROM local_stock WHERE group_name=? LIMIT ?", (group, qty)).fetchall()
+            # Lấy N dòng đầu tiên
+            rows = con.execute("SELECT id, content FROM local_stock WHERE group_name=? LIMIT ?", (group_name, qty)).fetchall()
             if not rows: return []
-            ids = [r['id'] for r in rows]
+            
+            ids_to_delete = [r['id'] for r in rows]
+            
+            # 1. LƯU VÀO LỊCH SỬ TRƯỚC
             now = get_vn_time()
-            for r in rows: con.execute("INSERT INTO local_history(group_name, content, fetched_at) VALUES(?,?,?)", (group, r['content'], now))
-            con.execute(f"DELETE FROM local_stock WHERE id IN ({','.join(['?']*len(ids))})", ids)
+            for r in rows:
+                con.execute("INSERT INTO local_history(group_name, content, fetched_at) VALUES(?,?,?)", (group_name, r['content'], now))
+            
+            # 2. XÓA KHỎI KHO (Để tránh bán trùng)
+            con.execute(f"DELETE FROM local_stock WHERE id IN ({','.join(['?']*len(ids_to_delete))})", ids_to_delete)
             con.commit()
-            return [{"product": r['content']} for r in rows]
+            
+            for r in rows:
+                products.append({"product": r['content']})
+    return products
 
-def get_local_stock_count(group):
-    with db() as con: return con.execute("SELECT COUNT(*) FROM local_stock WHERE group_name=?", (group,)).fetchone()[0]
-
+# --- 2. XỬ LÝ API MAIL72H (VÀ CÁC API TƯƠNG TỰ) ---
 def _mail72h_collect_all_products(obj):
-    all_p = []
-    if isinstance(obj, dict):
-        for c in obj.get('categories', []):
-            if isinstance(c, dict): all_p.extend(c.get('products', []))
-    return all_p
+    all_products = []
+    if not isinstance(obj, dict): return None
+    categories = obj.get('categories')
+    if not isinstance(categories, list): return None
+    for category in categories:
+        if isinstance(category, dict):
+            products_in_category = category.get('products')
+            if isinstance(products_in_category, list):
+                all_products.extend(products_in_category)
+    return all_products
 
-def mail72h_format_buy(base_url, api_key, product_id, amount):
-    r = requests.post(f"{base_url.rstrip('/')}/api/buy_product", data={"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET)
+def mail72h_format_buy(base_url: str, api_key: str, product_id: int, amount: int) -> dict:
+    data = {"action": "buyProduct", "id": product_id, "amount": amount, "api_key": api_key}
+    url = f"{base_url.rstrip('/')}/api/buy_product"
+    r = requests.post(url, data=data, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET) 
+    r.raise_for_status()
+    return r.json()
+
+def mail72h_format_product_list(base_url: str, api_key: str) -> dict:
+    params = {"api_key": api_key}
+    url = f"{base_url.rstrip('/')}/api/products.php"
+    r = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET)
+    r.raise_for_status()
     return r.json()
 
 def stock_mail72h_format(row):
-    try:
-        r = requests.get(f"{row['base_url'].rstrip('/')}/api/products.php", params={"api_key": row['api_key']}, timeout=DEFAULT_TIMEOUT, proxies=CURRENT_PROXY_SET)
-        data = r.json()
-        if data.get("status") != "success": return jsonify({"sum": 0})
-        for p in _mail72h_collect_all_products(data):
-            if str(p.get("id")) == str(row["product_id"]): return jsonify({"sum": int(p.get("amount", 0))})
-    except: pass
-    return jsonify({"sum": 0})
+    for retry_count in range(2): 
+        try:
+            base_url = row['base_url'] 
+            pid_to_find_str = str(row["product_id"])
+            list_data = mail72h_format_product_list(base_url, row["api_key"])
+            
+            if list_data.get("status") != "success":
+                return jsonify({"sum": 0}), 200
+
+            products = _mail72h_collect_all_products(list_data)
+            if not products: return jsonify({"sum": 0}), 200
+
+            stock_val = 0
+            for item in products:
+                try:
+                    item_id_str = str(int(float(str(item.get("id", 0)))))
+                except:
+                    continue
+                    
+                if item_id_str == pid_to_find_str:
+                    stock_val = int(item.get("amount", 0))
+                    break
+            
+            return jsonify({"sum": stock_val})
+        
+        except requests.exceptions.ProxyError:
+            switch_to_next_live_proxy()
+            continue
+        except Exception:
+            return jsonify({"sum": 0}), 200
+            
+    return jsonify({"sum": 0}), 200
 
 def fetch_mail72h_format(row, qty):
-    try:
-        res = mail72h_format_buy(row['base_url'], row["api_key"], int(row["product_id"]), qty)
-        if res.get("status") == "success":
-            d = res.get("data")
-            if isinstance(d, list): return jsonify([{"product": json.dumps(x, ensure_ascii=False) if isinstance(x, dict) else str(x)} for x in d])
-            return jsonify([{"product": json.dumps(d, ensure_ascii=False) if isinstance(d, dict) else str(d)} for _ in range(qty)])
-    except: pass
-    return jsonify([])
+    for retry_count in range(2): 
+        try:
+            base_url = row['base_url']
+            res = mail72h_format_buy(base_url, row["api_key"], int(row["product_id"]), qty)
+            
+            if res.get("status") != "success":
+                return jsonify([]), 200
+
+            data = res.get("data")
+            out = []
+            if isinstance(data, list):
+                for it in data:
+                    val = json.dumps(it, ensure_ascii=False) if isinstance(it, dict) else str(it)
+                    out.append({"product": val})
+            else:
+                val = json.dumps(data, ensure_ascii=False) if isinstance(data, dict) else str(data)
+                out = [{"product": val} for _ in range(qty)]
+            
+            return jsonify(out)
+            
+        except requests.exceptions.ProxyError:
+            switch_to_next_live_proxy()
+            continue
+        except Exception:
+            return jsonify([]), 200
+            
+    return jsonify([]), 200
 
 
 # ==============================================================================
-#   PHẦN 6: HTML TEMPLATES (GIAO DIỆN)
+# ==============================================================================
+#
+#   PHẦN 7: HTML TEMPLATES (GIAO DIỆN CHI TIẾT)
+#
+# ==============================================================================
 # ==============================================================================
 
-LOGIN_TPL = """<!doctype html><html data-theme="dark"><head><meta charset="utf-8"/><title>Login</title><style>body{background:#121212;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif}.box{background:#1c1c1e;padding:40px;border-radius:12px;text-align:center;box-shadow:0 4px 15px rgba(0,0,0,0.5)}input{padding:12px;margin:10px 0;width:100%;background:#2c2c2e;border:1px solid #333;color:white;border-radius:6px}button{padding:12px;width:100%;background:#0d6efd;color:white;border:none;cursor:pointer;border-radius:6px;font-weight:bold}</style></head><body><div class="box"><h2>QUANTUM GATE</h2><form method="post"><input type="password" name="admin_secret" placeholder="Enter Admin Password"><button>ACCESS DASHBOARD</button></form></div></body></html>"""
+# ------------------------------------------------------------------------------
+# 7.1. TEMPLATE ĐĂNG NHẬP (LOGIN)
+# ------------------------------------------------------------------------------
+LOGIN_TPL = """
+<!doctype html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <title>Đăng Nhập Quản Trị - Quantum Gate</title>
+    <style>
+        :root { 
+            --primary: #5a7dff; --red: #f07167; --bg-light: #121212; --border: #343a40;
+            --card-bg: #1c1c1e; --text-dark: #e9ecef; --text-light: #adb5bd; --input-bg: #2c2c2e;
+            --shadow: 0 4px 12px rgba(0,0,0,0.4); --space-gradient-start: #0a0a1a;
+            --space-gradient-end: #20204a; --star-color: #e0e0e0;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text-dark);
+            background: linear-gradient(135deg, var(--space-gradient-start) 0%, var(--space-gradient-end) 100%);
+            min-height: 100vh; display: flex; justify-content: center; align-items: center;
+            margin: 0; position: relative; overflow: hidden;
+        }
+        
+        .login-container {
+            width: 100%; max-width: 400px; padding: 40px 30px; border-radius: 12px;
+            background: var(--card-bg); box-shadow: var(--shadow); position: relative; z-index: 10;
+            text-align: left; 
+        }
+        
+        .header-info { display: flex; align-items: center; margin-bottom: 30px; flex-wrap: wrap; }
+        
+        .logo {
+            width: 40px; height: 40px; background: linear-gradient(45deg, #3a86ff, #5a7dff);
+            border-radius: 50%; display: flex; justify-content: center; align-items: center;
+            font-size: 20px; color: white; margin-right: 15px; font-weight: bold;
+            box-shadow: 0 0 10px rgba(90, 125, 255, 0.5);
+        }
+        
+        h1 {
+            font-size: 28px; font-weight: 700; color: var(--text-dark); margin: 0 0 10px 0;
+        }
+        
+        input {
+            width: 100%; padding: 14px 16px; margin-bottom: 30px; border: 1px solid var(--border);
+            border-radius: 10px; box-sizing: border-box; background: var(--input-bg);
+            color: var(--text-dark); transition: border-color .2s, box-shadow .2s; font-size: 16px;
+        }
+        
+        button {
+            width: 100%; padding: 15px 16px; border-radius: 10px; border: none;
+            background: linear-gradient(90deg, #3a86ff, #5a7dff); color: #fff; cursor: pointer;
+            font-weight: 700; font-size: 16px; box-shadow: 0 4px 15px rgba(90, 125, 255, 0.4);
+        }
+        
+        #space-background { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: hidden; z-index: 0; }
+        .star { position: absolute; background-color: var(--star-color); border-radius: 50%; opacity: 0; animation: twinkle 5s infinite ease-in-out; z-index: 0; }
+        @keyframes twinkle { 0%, 100% { opacity: 0; transform: scale(0.5); } 50% { opacity: 1; transform: scale(1.2); } }
+    </style>
+</head>
+<body>
+<div id="space-background"></div>
+<div class="login-container">
+    <div class="header-info"><div class="logo">∞</div><div><p style="font-size: 16px; font-weight: 600;">QUANTUM SECURITY GATE</p></div></div>
+    <h1>Đăng nhập</h1>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}{% for category, message in messages %}<div style="color: #f07167; margin-bottom: 10px;">{{ message }}</div>{% endfor %}{% endif %}
+    {% endwith %}
+    <form method="post" action="{{ url_for('login') }}"><input type="password" id="admin_secret" name="admin_secret" placeholder="Nhập mật khẩu..." required autofocus><button type="submit">🚀 Truy Cập</button></form>
+</div>
+<script>(function(){const s=document.getElementById('space-background');for(let i=0;i<100;i++){let d=document.createElement('div');d.className='star';d.style.width=Math.random()*3+'px';d.style.height=d.style.width;d.style.left=Math.random()*100+'%';d.style.top=Math.random()*100+'%';d.style.animationDelay=Math.random()*5+'s';s.appendChild(d)}})();</script>
+</body>
+</html>
+"""
 
+# ------------------------------------------------------------------------------
+# 7.2 TEMPLATE DASHBOARD QUẢN TRỊ (ADMIN_TPL)
+# ------------------------------------------------------------------------------
 ADMIN_TPL = """
 <!doctype html>
 <html data-theme="dark">
 <head>
     <meta charset="utf-8" />
-    <title>Admin Dashboard</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Multi-Provider Admin Dashboard</title>
     <style>
-    :root {
-        --primary: #0a84ff; --bg: #000; --card: #1c1c1e; --text: #f5f5f7; --border: #38383a;
-        --green: #30d158; --red: #ff453a; --yellow: #ffd60a;
+    /* --- CẤU HÌNH MÀU SẮC & BIẾN TOÀN CỤC --- */
+    :root { 
+        --primary: #5a7dff; --green: #20c997; --red: #f07167; --blue: #3a86ff; --gray: #adb5bd;
+        --shadow: 0 4px 12px rgba(0,0,0,0.2);
+        --bg-light: #121212; --border: #343a40; --card-bg: #1c1c1e;
+        --text-dark: #e9ecef; --text-light: #adb5bd; --input-bg: #2c2c2e;
+        --code-bg: #343a40; --star-color: #e0e0e0;
     }
+
+    /* Light Mode Variables */
+    :root[data-theme="light"] {
+        --primary: #0d6efd; --green: #198754; --red: #dc3545; --blue: #0d6efd; --gray: #6c757d;
+        --shadow: 0 4px 12px rgba(0,0,0,0.05);
+        --bg-light: #f8f9fa; --border: #dee2e6; --card-bg: #ffffff;
+        --text-dark: #212529; --text-light: #495057; --input-bg: #ffffff;
+        --code-bg: #e9ecef; --star-color: #888888;
+    }
+
+    /* --- BASE STYLES --- */
     body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-        background: var(--bg); color: var(--text); margin: 0; padding: 20px;
-        overflow-x: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        padding: 28px; color: var(--text-dark);
+        background: linear-gradient(135deg, var(--bg-light) 0%, #20204a 100%);
+        line-height: 1.6; min-height: 100vh; margin: 0; position: relative; overflow-x: hidden;
     }
-    .container { max-width: 1200px; margin: 0 auto; position: relative; z-index: 10; }
+
+    /* --- CARD COMPONENT --- */
     .card {
-        background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-        padding: 20px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-bottom: 24px;
+        background: var(--card-bg); box-shadow: var(--shadow); position: relative; z-index: 10;
     }
-    h2, h3 { margin-top: 0; font-weight: 600; color: var(--primary); }
-    h3 { border-bottom: 1px solid var(--border); padding-bottom: 10px; font-size: 1.1rem; }
-    .row { display: grid; grid-template-columns: repeat(12, 1fr); gap: 15px; }
-    .col-6 { grid-column: span 6; } .col-8 { grid-column: span 8; } .col-4 { grid-column: span 4; } .col-12 { grid-column: span 12; }
-    
-    input, textarea, select {
-        width: 100%; padding: 10px; margin-bottom: 10px;
-        background: #2c2c2e; border: 1px solid #48484a; color: #fff;
-        border-radius: 6px; box-sizing: border-box; font-family: monospace;
+
+    /* --- GRID SYSTEM --- */
+    .row { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; align-items: end; }
+    .col-2 { grid-column: span 2; } .col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; } .col-6 { grid-column: span 6; } .col-8 { grid-column: span 8; } .col-12 { grid-column: span 12; }
+
+    /* --- FORM ELEMENTS --- */
+    label { font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--text-light); margin-bottom: 6px; display: block; }
+    input, select, textarea {
+        width: 100%; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px;
+        box-sizing: border-box; background: var(--input-bg); color: var(--text-dark); font-size: 14px; transition: border-color 0.2s, box-shadow 0.2s; font-family: monospace;
     }
-    input:focus, textarea:focus { border-color: var(--primary); outline: none; }
+    input:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px rgba(90, 125, 255, 0.25); }
+
+    /* --- BUTTONS --- */
+    button, .btn { padding: 10px 20px; border-radius: 8px; border: none; background: var(--primary); color: #fff; font-weight: 600; cursor: pointer; transition: filter 0.2s, transform 0.1s; }
+    button:hover, .btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+    .btn.red { background: var(--red); } .btn.green { background: var(--green); } .btn.blue { background: var(--blue); } .btn.gray { background: var(--gray); }
+    .btn.small { padding: 6px 12px; font-size: 12px; }
+
+    /* --- TABLES (DÙNG CHO LOCAL STOCK & PROXY) --- */
+    table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 13px; }
+    th, td { padding: 12px 15px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
+    th { font-size: 12px; text-transform: uppercase; color: var(--text-light); letter-spacing: 0.5px; }
     
-    button {
-        padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer;
-        font-weight: 600; background: var(--primary); color: white; transition: 0.2s;
+    /* --- NESTED DETAILS / SUMMARY (DÙNG CHO DANH SÁCH KEY) --- */
+    details.folder { border: 1px solid var(--border); border-radius: 10px; margin-bottom: 15px; overflow: hidden; }
+    details.folder > summary { padding: 15px 20px; cursor: pointer; font-weight: 700; font-size: 16px; background: var(--card-bg); color: var(--primary); list-style: none; }
+    details.folder > .content { padding: 20px; background: var(--bg-light); border-top: 1px solid var(--border); }
+    details.provider { margin-top: 15px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    details.provider > summary { padding: 12px 15px; cursor: pointer; font-weight: 600; font-size: 14px; background: #2a2a2d; color: #fff; }
+    details.provider > .content { padding: 0; background: transparent; }
+
+    /* Cấp 3: Bảng Key Chi Tiết (FIX WRAPPING) */
+    .provider-table { width: 100%; border-collapse: collapse; }
+    .provider-table th { background: #1f1f22; font-size: 11px; color: #aaa; padding: 10px 15px; border-bottom: 1px solid #333; }
+    .provider-table td { border-bottom: 1px solid #333; padding: 10px 15px; font-size: 13px; color: #e0e0e0; white-space: nowrap; } 
+    
+    /* FIX: SKU Truncation */
+    .truncate-sku-cell {
+        white-space: nowrap; overflow: hidden; max-width: 300px; display: block; font-size: 11px;
     }
-    button:hover { opacity: 0.8; }
-    .btn-green { background: var(--green); color: #000; }
-    .btn-red { background: var(--red); color: #fff; }
+
+    /* BADGES */
+    .badge-key {
+        display: inline-block; background: rgba(58, 134, 255, 0.15); color: #5a7dff; 
+        padding: 4px 8px; border-radius: 4px; font-family: monospace; font-weight: bold;
+        border: 1px solid rgba(58, 134, 255, 0.3); white-space: nowrap; 
+    }
+    .badge-url { background: #343a40; color: #adb5bd; padding: 3px 6px; border-radius: 4px; font-size: 12px; font-family: monospace; }
     
-    label { font-size: 11px; font-weight: bold; color: #888; display: block; margin-bottom: 5px; }
-    
-    @media (max-width: 768px) { .col-6, .col-8, .col-4 { grid-column: span 12; } }
-    
-    #effect-canvas { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; }
+    /* ANIMATIONS & UTILS */
+    .space-background { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; }
+    .star { position: absolute; background-color: var(--star-color); border-radius: 50%; opacity: 0; animation: twinkle 5s infinite; }
+    .astronaut { position: absolute; width: 120px; height: 120px; background-image: url('https://freepng.flyclipart.com/thumb/cat-astronaut-space-suit-moon-outer-space-png-sticker-31913.png'); background-size: contain; animation: floatAstronaut 25s infinite ease-in-out; z-index: 1; opacity: 0.8; pointer-events: none; }
     </style>
+    
+    <script>(function(){var m=document.cookie.split('; ').find(r=>r.startsWith('admin_mode='))?.split('=')[1]||'dark';document.documentElement.setAttribute('data-theme',m)})();</script>
 </head>
 <body>
-    <canvas id="effect-canvas"></canvas>
+
+{% if effect == 'astronaut' %}<div class="space-background" id="space-background"></div>{% endif %}
+
+<div id="main-content" style="position: relative; z-index: 10;"> 
+  
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}{% for category, message in messages %}<div class="flash-alert {{ category }}">{{ message }}</div>{% endfor %}{% endif %}
+  {% endwith %}
+  
+  <h2>⚙️ Multi-Provider Admin Dashboard</h2>
+  
+  <div class="card" id="add-key-form-card">
+    <h3>1. Thêm Key & Cấu Hình</h3>
+    <form method="post" action="{{ url_for('admin_add_keymap') }}" id="main-key-form">
+      <div class="row" style="margin-bottom: 20px;">
+        <div class="col-4"><label>Group Name (Nhóm Website)</label><input class="mono" name="group_name" placeholder="VD: Netflix, Spotify..." required></div>
+        <div class="col-4">
+            <label>Provider Type (Loại)</label>
+            <input class="mono" name="provider_type" list="ptypes" placeholder="mail72h / local" required oninput="checkProviderType(this)" id="pt_input">
+            <datalist id="ptypes"><option value="mail72h"><option value="local"></datalist>
+        </div>
+        <div class="col-4" id="div_base_url"><label>Base URL (Nếu dùng API)</label><input class="mono" name="base_url" placeholder="https://api.website.com"></div>
+      </div>
+      
+      <div class="row">
+         <div class="col-2"><label>SKU</label><input class="mono" name="sku" required></div>
+         <div class="col-3"><label>Input Key (Mã bán)</label><input class="mono" name="input_key" required></div>
+         <div class="col-2" id="div_prod_id"><label>Product ID</label><input class="mono" name="product_id" placeholder="ID..."></div>
+         <div class="col-3" id="div_api_key"><label>API Key (Nếu có)</label><input class="mono" name="api_key" type="password"></div>
+         <div class="col-2"><button type="submit" style="width: 100%; height: 42px; margin-top: 20px;">Lưu Key</button></div>
+      </div>
+    </form>
     
-    <div class="container">
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-            <h2>⚙️ QUANTUM DASHBOARD</h2>
-            <div>
-                <select id="effect-select" style="width:auto; display:inline-block;" onchange="changeEffect(this.value)">
-                    <option value="none">No Effect</option>
-                    <option value="matrix">Matrix</option>
-                    <option value="snow">Snow</option>
-                    <option value="particles">Particles</option>
-                </select>
-                <form action="{{url_for('logout')}}" method="post" style="display:inline;">
-                    <button class="btn-red">Logout</button>
-                </form>
+    <details style="margin-top: 15px; border-top: 1px dashed var(--border); padding-top: 10px;">
+        <summary style="cursor: pointer; color: var(--green); font-weight: bold;">➕ Thêm Input Key Hàng Loạt (Dành cho Local)</summary>
+        <form method="post" action="{{ url_for('admin_add_keymap_bulk') }}" style="margin-top: 15px;">
+            <div class="row">
+                <div class="col-4"><label>Group Name (Kho Hàng)</label><input class="mono" name="group_name" required placeholder="Nhập tên nhóm..."></div>
+                <div class="col-4"><label>SKU Prefix (Optional)</label><input class="mono" name="sku_prefix" placeholder="VD: NF_"></div>
+                <div class="col-4"><button type="submit" class="btn green" style="width: 100%; height: 42px; margin-top: 20px;">🚀 Thêm Ngay</button></div>
             </div>
+            <label style="margin-top: 10px;">Danh sách Input Key (Mỗi dòng 1 key)</label>
+            <textarea class="mono" name="bulk_keys" rows="5" placeholder="KEY_1&#10;KEY_2&#10;..." required></textarea>
+        </form>
+    </details>
+  </div>
+
+  <div class="card">
+    <h3>2. Danh Sách Keymaps (Theo Website)</h3>
+    {% if not grouped_data %}<p style="text-align: center; color: var(--text-light); padding: 20px;">Chưa có key nào được thêm.</p>{% endif %}
+
+    {% for folder, providers in grouped_data.items() %}
+      <details class="folder">
+        <summary>📁 Website: {{ folder }}</summary>
+        <div class="content">
+          
+          {% for provider, keys in providers.items() %}
+            <details class="provider">
+              <summary>📦 Provider: {{ provider }} ({{ keys|length }} keys)</summary>
+              <div class="content">
+                
+                <table class="provider-table">
+                  <thead>
+                    <tr>
+                      <th style="width: 25%;">SKU</th>
+                      <th style="width: 25%;">INPUT KEY</th>
+                      <th style="width: 20%;">BASE URL</th>
+                      <th style="width: 5%;">ID</th>
+                      <th style="width: 5%;">ACTIVE</th>
+                      <th style="width: 20%;">HÀNH ĐỘNG</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                  {% for k in keys %}
+                    <tr>
+                      <td><span class="truncate-sku-cell">{{ k.sku }}</span></td>
+                      <td><span class="badge-key">{{ k.input_key }}</span></td>
+                      <td><span class="badge-url">{{ k.base_url }}</span></td>
+                      <td>{{ k.product_id }}</td> 
+                      <td>{% if k.is_active %}<span style="color: var(--green);">✅</span>{% else %}<span style="color: var(--red);">❌</span>{% endif %}</td>
+                      <td> 
+                        <div style="display: flex; gap: 5px;">
+                            <form method="post" action="{{ url_for('admin_toggle_key', kmid=k.id) }}" style="margin:0;"><button class="btn blue small" type="submit">{{ 'Tắt' if k.is_active else 'Bật' }}</button></form>
+                            <form method="post" action="{{ url_for('admin_delete_key', kmid=k.id) }}" onsubmit="return confirm('Xác nhận xóa key này?');" style="margin:0;"><button class="btn red small" type="submit">Xoá</button></form>
+                        </div>
+                      </td>
+                    </tr>
+                  {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </details>
+          {% endfor %}
+          
         </div>
+      </details>
+    {% endfor %}
+  </div>
 
-        <div class="row">
-            <div class="col-6 card">
-                <h3>1. Quản Lý Key (API / Local)</h3>
-                <form action="{{url_for('admin_add_keymap')}}" method="post">
-                    <input name="group_name" placeholder="Group Name (VD: Netflix)" required>
-                    <input name="provider_type" placeholder="local / mail72h" required>
-                    <input name="sku" placeholder="SKU Code" required>
-                    <input name="input_key" placeholder="Input Key (Mã bán)" required>
-                    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
-                        <input name="base_url" placeholder="API URL">
-                        <input name="api_key" placeholder="API Key">
-                    </div>
-                    <input name="product_id" placeholder="Product ID (0 nếu là local)">
-                    <button style="width:100%">Lưu Key</button>
-                </form>
-            </div>
+  <div class="card">
+    <h3>3. Backup & Restore</h3>
+    <div class="row">
+      <div class="col-6">
+        <h4>Tải Backup (JSON)</h4>
+        <p style="color: var(--text-light); margin-bottom: 15px;">Render sẽ xóa sạch dữ liệu khi Restart. Hãy tải file này thường xuyên.</p>
+        <a href="{{ url_for('admin_backup_download') }}" class="btn green">⬇️ Tải Xuống Backup</a>
+      </div>
+      <div class="col-6" style="border-left: 1px solid var(--border); padding-left: 20px;">
+        <h4>Restore Thủ Công</h4>
+        <p style="color: var(--text-light); margin-bottom: 15px;">Upload file JSON để khôi phục dữ liệu ngay lập tức.</p>
+        <form method="post" action="{{ url_for('admin_backup_upload') }}" enctype="multipart/form-data" onsubmit="return confirm('CẢNH BÁO: Ghi đè dữ liệu?');">
+          <input type="file" name="backup_file" accept=".json" required style="margin-bottom: 10px;"><button type="submit" class="btn red">⬆️ Upload & Restore</button>
+        </form>
+      </div>
+    </div>
+  </div>
 
-            <div class="col-6 card">
-                <h3>2. Proxy System</h3>
-                <div style="margin-bottom:10px">Current Proxy: <code style="color:var(--green)">{{current_proxy or 'Direct'}}</code></div>
-                <form action="{{url_for('admin_add_proxy')}}" method="post">
-                    <textarea name="proxies" rows="5" placeholder="ip:port&#10;ip:port:user:pass"></textarea>
-                    <button style="width:100%">Thêm Proxy</button>
-                </form>
-            </div>
-        </div>
-
-        <div class="card" style="border: 1px solid var(--yellow);">
-            <h3 style="color: var(--yellow);">🚀 6. TikTok Checker (Logic Mới: Fix Captcha = Live)</h3>
-            <form action="{{url_for('admin_run_checker')}}" method="post" target="_blank">
-                <div class="row">
-                    <div class="col-8">
-                        <label>INPUT LIST (MỖI DÒNG 1 ID HOẶC USER|PASS...)</label>
-                        <textarea name="check_list" rows="8" placeholder="tiktok_id_1&#10;tiktok_id_2|pass..." required></textarea>
-                    </div>
-                    <div class="col-4">
-                        <label>PROXY RIÊNG (OPTIONAL - AUTO ROTATE)</label>
-                        <textarea name="check_proxies" rows="4" placeholder="ip:port:user:pass..."></textarea>
-                        
-                        <label>SỐ LUỒNG (THREADS)</label>
-                        <input type="number" name="threads" value="20" min="1" max="200">
-                        
-                        <button class="btn-green" style="width:100%; margin-top:15px; font-size:16px;">🚀 BẮT ĐẦU CHECK</button>
-                    </div>
-                </div>
-            </form>
-        </div>
-
-        <div class="card" id="local-stock">
-            <h3>4. Kho Hàng Local</h3>
-            <form action="{{url_for('admin_local_stock_add')}}" method="post" enctype="multipart/form-data">
-                <div style="display:flex; gap:10px;">
-                    <input name="group_name" placeholder="Group Name" list="grps" required style="flex:1">
-                    <datalist id="grps">{% for g in local_groups %}<option value="{{g}}">{% endfor %}</datalist>
-                    <input type="file" name="stock_file" style="flex:1">
-                </div>
-                <button class="btn-green" style="width:100%">Upload Stock</button>
-            </form>
+  <div class="row">
+    <div class="col-6 card" id="local-stock">
+        <h3 style="color: var(--green);">📦 4. Kho Hàng Thủ Công (Local Stock)</h3>
+        
+        <form method="post" action="{{ url_for('admin_local_stock_add') }}" enctype="multipart/form-data">
+            <div style="margin-bottom: 15px;"><label>Group Name (Phải trùng với Keymap đã tạo)</label><input class="mono" name="group_name" list="group_hints" required placeholder="VD: Netflix"><datalist id="group_hints">{% for g in local_groups %}<option value="{{ g }}">{% endfor %}</datalist></div>
             
-            <div style="margin-top:15px; max-height:400px; overflow-y:auto; border:1px solid #333; border-radius:6px;">
-                {% for g, c in local_stats.items() %}
-                <div style="padding:10px; border-bottom:1px solid #333; display:flex; justify-content:space-between; align-items:center; background: rgba(255,255,255,0.05);">
-                    <span><b>{{g}}</b>: <span style="color:var(--green)">{{c}}</span></span>
-                    <div style="display:flex; gap:5px;">
-                        <input id="q_{{g}}" type="number" value="1" style="width:50px; margin:0;" min="1">
-                        <button class="btn-green" style="padding:4px 8px; font-size:12px;" onclick="quickGet('{{g}}')">⚡ Lấy</button>
-                        <a href="{{url_for('admin_local_stock_view', group=g)}}" style="background:#333; color:white; padding:6px 12px; border-radius:4px; text-decoration:none; font-size:12px; display:flex; align-items:center;">Xem</a>
-                        <form action="{{url_for('admin_local_stock_clear')}}" method="post" style="margin:0;" onsubmit="return confirm('Xóa sạch kho {{g}}?')">
-                            <input type="hidden" name="group_name" value="{{g}}">
-                            <button class="btn-red" style="padding:4px 8px; font-size:12px;">Xóa</button>
-                        </form>
-                    </div>
-                </div>
-                {% endfor %}
+            <div class="row">
+                <div class="col-6"><div style="border: 1px dashed var(--border); padding: 10px; border-radius: 6px;"><label style="color: var(--primary);">Cách 1: Upload File .txt</label><input type="file" name="stock_file" accept=".txt" class="mono" style="margin-top: 5px;"></div></div>
+                <div class="col-6"><label>Cách 2: Dán Dữ Liệu (Mỗi dòng 1 acc)</label><textarea class="mono" name="content" rows="3" placeholder="user|pass..."></textarea></div>
             </div>
+            
+            <button type="submit" class="btn green" style="width: 100%; margin-top: 15px;">⬆️ Up Hàng Vào Kho</button>
+        </form>
+        
+        <h4 style="margin-top: 25px; border-bottom: 1px solid var(--border); padding-bottom: 5px;">Thống Kê Tồn Kho</h4>
+        <div style="max-height: 250px; overflow-y: auto;">
+            {% for g, c in local_stats.items() %}<div style="display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed var(--border);"><span><b style="color: var(--primary);">{{ g }}</b>: <span style="background: var(--input-bg); padding: 2px 6px; border-radius: 4px;">{{ c }} items</span></span><div><a href="{{ url_for('admin_local_stock_view', group=g) }}" class="btn blue small">Xem/Lấy</a><form action="{{ url_for('admin_local_stock_clear') }}" method="post" style="display: inline;" onsubmit="return confirm('XÓA SẠCH kho {{g}}?');"><input type="hidden" name="group_name" value="{{ g }}"><button class="btn red small">Xóa</button></form></div></div>{% else %}<p style="text-align: center; color: var(--text-light); padding: 10px;">Kho đang trống.</p>{% endfor %}
         </div>
     </div>
 
+    <div class="col-6 card">
+        <h3>5. Quản Lý Proxy & Ping</h3>
+        
+        <div style="margin-bottom: 15px;">Proxy Đang Dùng: <code class="mono" style="color: var(--green); font-size: 1.1em;">{{ current_proxy or 'Direct Connection' }}</code></div>
+        
+        <form method="post" action="{{ url_for('admin_add_proxy') }}">
+            <label>Thêm Danh Sách Proxy (Mỗi dòng 1 cái: ip:port)</label>
+            <textarea class="mono" name="proxies" rows="4" placeholder="ip:port&#10;ip:port:user:pass"></textarea>
+            <button type="submit" class="btn green" style="margin-top: 10px; width: 100%;">➕ Thêm Proxy</button>
+        </form>
+        
+        <div style="margin-top: 20px; max-height: 200px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px;">
+            <table style="margin: 0;">
+                <thead><tr><th>Proxy</th><th>Status</th><th>Ping</th><th>Xóa</th></tr></thead>
+                <tbody>
+                {% for p in proxies %}
+                    <tr>
+                        <td class="mono" style="font-size: 11px;">{{ p.proxy_string }}</td>
+                        <td style="font-weight: bold; color: {{ 'var(--green)' if p.is_live else 'var(--red)' }};">
+                            {{ 'LIVE' if p.is_live else 'DIE' }}
+                        </td>
+                        <td>{{ "%.2f"|format(p.latency) }}s</td>
+                        <td>
+                            <form action="{{ url_for('admin_delete_proxy') }}" method="post">
+                                <input type="hidden" name="id" value="{{ p.id }}">
+                                <button class="btn red small" style="padding: 2px 6px;">x</button>
+                            </form>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        
+        <hr style="border-color: var(--border); margin: 25px 0;">
+        
+        <h4>🌐 Cấu Hình Ping (Anti-Sleep)</h4>
+        <form method="post" action="{{ url_for('admin_save_ping') }}">
+            <div class="row">
+                <div class="col-8">
+                    <label>URL Web (https://...)</label>
+                    <input class="mono" name="ping_url" value="{{ ping.url }}" placeholder="https://myapp.onrender.com">
+                </div>
+                <div class="col-4">
+                    <label>Chu kỳ Ping (Giây)</label>
+                    <input class="mono" name="ping_interval" type="number" value="{{ ping.interval }}" placeholder="300">
+                </div>
+            </div>
+            <button type="submit" class="btn blue" style="width: 100%; margin-top: 15px;">Lưu Cấu Hình</button>
+        </form>
+    </div>
+  </div>
+
+  <div class="card" style="padding: 20px;">
+    <div class="row" style="align-items: center;">
+      <div class="col-4"><label>Giao diện</label><select id="mode-switcher" class="mono"><option value="dark" {% if mode == 'dark' %}selected{% endif %}>Tối (Dark)</option><option value="light" {% if mode == 'light' %}selected{% endif %}>Sáng (Light)</option></select></div>
+      <div class="col-4"><label>Hiệu ứng nền</label><select id="effect-switcher" class="mono"><option value="default" {% if effect == 'default' %}selected{% endif %}>Tắt Hiệu Ứng</option><option value="astronaut" {% if effect == 'astronaut' %}selected{% endif %}>Phi hành gia (Astronaut)</option><option value="snow" {% if effect == 'snow' %}selected{% endif %}>Tuyết Rơi (Snow)</option><option value="matrix" {% if effect == 'matrix' %}selected{% endif %}>Ma Trận (Matrix)</option><option value="rain" {% if effect == 'rain' %}selected{% endif %}>Mưa Rơi (Rain)</option><option value="particles" {% if effect == 'particles' %}selected{% endif %}>Hạt Kết Nối (Particles)</option><option value="sakura" {% if effect == 'sakura' %}selected{% endif %}>Hoa Anh Đào (Sakura)</option></select></div>
+      <div class="col-4"><label>&nbsp;</label><form method="post" action="{{ url_for('logout') }}"><button class="btn red" type="submit" style="width: 100%;">Đăng Xuất Hệ Thống</button></form></div>
+    </div>
+  </div>
+
+</div> 
+
 <script>
-// Logic Lấy Hàng
-async function quickGet(g){
-    let q = document.getElementById('q_'+g).value;
-    if(confirm(`Lấy ${q} items từ ${g}?`)){
-        try {
-            let r = await fetch(`/admin/local-stock/quick-get?group=${g}&qty=${q}`);
-            if(r.ok){
-                let t = await r.text();
-                if(t){ await navigator.clipboard.writeText(t); alert("✅ Đã lấy và COPY thành công!"); location.reload(); }
-                else alert("❌ Hết hàng!");
-            }
-        } catch(e) { alert("Error: "+e); }
-    }
+function checkProviderType(input) {
+    const val = input ? input.value : document.getElementById('pt_input').value;
+    const isLocal = val === 'local';
+    document.getElementById('div_prod_id').style.display = isLocal ? 'none' : 'block';
+    document.getElementById('div_base_url').style.display = isLocal ? 'none' : 'block';
+    document.getElementById('div_api_key').style.display = isLocal ? 'none' : 'block';
 }
+checkProviderType();
 
-// Logic Effect
-let canvas=document.getElementById('effect-canvas'), ctx=canvas.getContext('2d'), w, h;
-function resize(){ w=canvas.width=window.innerWidth; h=canvas.height=window.innerHeight; }
-window.addEventListener('resize', resize); resize();
-
-function startEffect(type){
-    if(type === 'matrix') {
-        const cols = Math.floor(w/20)+1, ypos = Array(cols).fill(0);
-        function step(){
-            ctx.fillStyle = '#0001'; ctx.fillRect(0,0,w,h);
-            ctx.fillStyle = '#0f0'; ctx.font = '15pt monospace';
-            ypos.forEach((y,i) => {
-                ctx.fillText(String.fromCharCode(Math.random()*128), i*20, y);
-                ypos[i] = (y>100+Math.random()*10000) ? 0 : y+20;
-            });
-            requestAnimationFrame(step);
-        }
-        step();
-    } else { ctx.clearRect(0,0,w,h); }
-}
-document.addEventListener("DOMContentLoaded", () => {
-    let e = localStorage.getItem('effect') || 'matrix';
-    document.getElementById('effect-select').value = e;
-    startEffect(e);
+document.getElementById('effect-switcher').addEventListener('change', function() {
+    document.cookie = `admin_effect=${this.value};path=/;max-age=31536000;SameSite=Lax`;
+    location.reload();
 });
-function changeEffect(v){ localStorage.setItem('effect',v); location.reload(); }
+
+document.getElementById('mode-switcher').addEventListener('change', function() {
+    document.cookie = `admin_mode=${this.value};path=/;max-age=31536000;SameSite=Lax`;
+    location.reload();
+});
+
+function createEffectCanvas(id) {
+    if (document.getElementById(id)) return null; 
+    var canvas = document.createElement('canvas');
+    canvas.id = id;
+    canvas.className = 'effect-canvas'; 
+    document.body.appendChild(canvas);
+    var ctx = canvas.getContext('2d');
+    var W = window.innerWidth;
+    var H = window.innerHeight;
+    canvas.width = W;
+    canvas.height = H;
+    window.addEventListener('resize', function() {
+        W = window.innerWidth;
+        H = window.innerHeight;
+        canvas.width = W;
+        canvas.height = H;
+    });
+    return { canvas, ctx, W, H };
+}
 </script>
+
+{% if effect == 'astronaut' %}
+<script>
+(function() {
+    const spaceBackground = document.getElementById('space-background');
+    if (!spaceBackground) return;
+    for (let i = 0; i < 100; i++) {
+        let star = document.createElement('div');
+        star.className = 'star';
+        star.style.width = star.style.height = `${Math.random() * 3 + 1}px`;
+        star.style.left = `${Math.random() * 100}%`;
+        star.style.top = `${Math.random() * 100}%`;
+        star.style.animationDelay = `${Math.random() * 5}s`;
+        spaceBackground.appendChild(star);
+    }
+    let astronaut = document.createElement('div');
+    astronaut.className = 'astronaut';
+    astronaut.style.left = '10%';
+    astronaut.style.top = '20%';
+    spaceBackground.appendChild(astronaut);
+})();
+</script>
+{% endif %}
+
+{% if effect == 'snow' %}
+<script>
+(function() {
+    var a = createEffectCanvas('snow-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    var mp = 100; 
+    var flakes = [];
+    for(var i = 0; i < mp; i++) {
+        flakes.push({
+            x: Math.random() * W, y: Math.random() * H,
+            r: Math.random() * 4 + 1, d: Math.random() * 100
+        });
+    }
+    var angle = 0;
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.8)";
+        ctx.beginPath();
+        for(var i = 0; i < 100; i++) {
+            var f = flakes[i];
+            ctx.moveTo(f.x, f.y);
+            ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2, true);
+        }
+        ctx.fill();
+        update();
+        requestAnimationFrame(draw);
+    }
+    function update() {
+        angle += 0.01;
+        for(var i = 0; i < 100; i++) {
+            var f = flakes[i];
+            f.y += Math.cos(angle + f.d) + 1 + f.r / 2;
+            f.x += Math.sin(angle) * 2;
+            if(f.x > W + 5 || f.x < -5 || f.y > H) {
+                if(i % 3 > 0) { flakes[i] = {x: Math.random() * W, y: -10, r: f.r, d: f.d}; }
+                else {
+                    if(Math.sin(angle) > 0) { flakes[i] = {x: -5, y: Math.random() * H, r: f.r, d: f.d}; }
+                    else { flakes[i] = {x: W + 5, y: Math.random() * H, r: f.r, d: f.d}; }
+                }
+            }
+        }
+    }
+    draw();
+})();
+</script>
+{% endif %}
+
+{% if effect == 'matrix' %}
+<script>
+(function() {
+    var a = createEffectCanvas('matrix-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    var font_size = 14;
+    var columns = Math.floor(W / font_size);
+    var drops = [];
+    for(var x = 0; x < columns; x++) drops[x] = 1; 
+    var chars = "0123456789ABCDEF@#$%^&*()";
+    chars = chars.split("");
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(0, 0, 0, 0.05)";
+        ctx.fillRect(0, 0, W, H);
+        ctx.fillStyle = "#0F0"; 
+        ctx.font = font_size + "px monospace";
+        for(var i = 0; i < drops.length; i++) {
+            var text = chars[Math.floor(Math.random() * chars.length)];
+            ctx.fillText(text, i * font_size, drops[i] * font_size);
+            if(drops[i] * font_size > H && Math.random() > 0.975) {
+                drops[i] = 0;
+            }
+            drops[i]++;
+        }
+    }
+    setInterval(draw, 33);
+})();
+</script>
+{% endif %}
+
+{% if effect == 'rain' %}
+<script>
+(function() {
+    var a = createEffectCanvas('rain-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    var drops = [];
+    var dropCount = 500;
+    for (var i = 0; i < dropCount; i++) {
+        drops.push({
+            x: Math.random() * W, 
+            y: Math.random() * H, 
+            l: Math.random() * 1, 
+            v: Math.random() * 4 + 4
+        });
+    }
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.strokeStyle = "rgba(174, 194, 224, 0.5)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (var i = 0; i < dropCount; i++) {
+            var d = drops[i];
+            ctx.moveTo(d.x, d.y);
+            ctx.lineTo(d.x, d.y + d.l * 5);
+            d.y += d.v;
+            if (d.y > H) {
+                d.y = -20;
+                d.x = Math.random() * W;
+            }
+        }
+        ctx.stroke();
+        requestAnimationFrame(draw);
+    }
+    draw();
+})();
+</script>
+{% endif %}
+
+{% if effect == 'particles' %}
+<script>
+(function() {
+    var a = createEffectCanvas('particles-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    var particleCount = 80;
+    var particles = [];
+    for (var i = 0; i < particleCount; i++) {
+        particles.push({
+            x: Math.random() * W,
+            y: Math.random() * H,
+            vx: (Math.random() - 0.5) * 1,
+            vy: (Math.random() - 0.5) * 1
+        });
+    }
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = "rgba(200, 200, 200, 0.5)";
+        ctx.strokeStyle = "rgba(200, 200, 200, 0.1)";
+        for (var i = 0; i < particles.length; i++) {
+            var p = particles[i];
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 2, 0, Math.PI * 2);
+            ctx.fill();
+            p.x += p.vx;
+            p.y += p.vy;
+            if (p.x < 0 || p.x > W) p.vx *= -1;
+            if (p.y < 0 || p.y > H) p.vy *= -1;
+            for (var j = i + 1; j < particles.length; j++) {
+                var p2 = particles[j];
+                var dx = p.x - p2.x;
+                var dy = p.y - p2.y;
+                var dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist < 100) {
+                    ctx.beginPath();
+                    ctx.moveTo(p.x, p.y);
+                    ctx.lineTo(p2.x, p2.y);
+                    ctx.stroke();
+                }
+            }
+        }
+        requestAnimationFrame(draw);
+    }
+    draw();
+})();
+</script>
+{% endif %}
+
+{% if effect == 'sakura' %}
+<script>
+(function() {
+    var a = createEffectCanvas('sakura-canvas');
+    if (!a) return;
+    var ctx = a.ctx, W = a.W, H = a.H;
+    var mp = 60;
+    var petals = [];
+    for(var i = 0; i < mp; i++) {
+        petals.push({
+            x: Math.random() * W, 
+            y: Math.random() * H,
+            r: Math.random() * 4 + 2, 
+            d: Math.random() * mp,
+            c: (Math.random() > 0.5) ? "#ffc0cb" : "#ffffff"
+        });
+    }
+    var angle = 0;
+    function draw() {
+        ctx.clearRect(0, 0, W, H);
+        for(var i = 0; i < 60; i++) {
+            var p = petals[i];
+            ctx.fillStyle = p.c;
+            ctx.globalAlpha = 0.7;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2, true);
+            ctx.fill();
+        }
+        angle += 0.01;
+        for(var i = 0; i < 60; i++) {
+            var p = petals[i];
+            p.y += Math.cos(angle + p.d) + 1 + p.r / 2;
+            p.x += Math.sin(angle);
+            if(p.x > W + 5 || p.x < -5 || p.y > H) {
+                p.x = Math.random() * W;
+                p.y = -10;
+            }
+        }
+        requestAnimationFrame(draw);
+    }
+    draw();
+})();
+</script>
+{% endif %}
 </body>
 </html>
 """
 
+# ------------------------------------------------------------------------------
+# 7.3 TEMPLATE XEM CHI TIẾT KHO HÀNG (STOCK_VIEW_TPL)
+# ------------------------------------------------------------------------------
 STOCK_VIEW_TPL = """
-<!doctype html><html data-theme="dark"><head><title>{{group}}</title>
-<style>
-body{background:#121212;color:#fff;font-family:monospace;padding:20px}
-table{width:100%;border-collapse:collapse;margin-top:20px}
-th,td{border:1px solid #333;padding:10px;text-align:left} th{background:#1c1c1e;color:#888}
-button{cursor:pointer;border:none;padding:5px 10px;border-radius:4px;color:white;font-weight:bold}
-a{color:#0d6efd;text-decoration:none}
-</style></head><body>
-<h2>📦 Group: {{group}} ({{items|length}})</h2>
-<div style="display:flex;gap:10px;align-items:center;">
-    <a href="{{url_for('admin_index')}}#local-stock">🔙 Quay lại</a>
-    <a href="{{url_for('admin_local_stock_download', group=group)}}" style="background:#20c997;color:black;padding:5px;border-radius:4px">📥 Download</a>
-    <form action="{{url_for('admin_run_checker')}}" method="post" target="_blank" style="margin:0">
-        <input type="hidden" name="local_group" value="{{group}}">
-        <button style="background:#ffc107;color:black">🔍 Check Live (TikTok)</button>
-    </form>
-</div>
-<table><thead><tr><th>#</th><th>Data</th><th>Date</th><th>Action</th></tr></thead><tbody>
-{% for i in items %}
-<tr><td>{{loop.index}}</td><td style="color:#20c997;word-break:break-all">{{i.content}}</td><td>{{i.added_at}}</td>
-<td><form action="{{url_for('admin_local_stock_delete_one')}}" method="post"><input type="hidden" name="id" value="{{i.id}}"><input type="hidden" name="group" value="{{group}}"><button style="background:#dc3545">X</button></form></td></tr>
-{% endfor %}
-</tbody></table></body></html>
-"""
-
-# TEMPLATE CHECKER STREAM - CHUẨN XÁC
-CHECKER_STREAM_TPL = """
 <!doctype html>
 <html data-theme="dark">
 <head>
     <meta charset="utf-8" />
-    <title>Checker Progress</title>
+    <title>Chi tiết kho {{ group }}</title>
     <style>
-    body { background: #121212; color: #fff; font-family: monospace; padding: 20px; }
-    .stats { display: flex; gap: 20px; background: #1c1c1e; padding: 15px; border-radius: 8px; border: 1px solid #333; font-size: 1.2rem; }
-    .live { color: #30d158; font-weight: bold; }
-    .die { color: #ff453a; font-weight: bold; }
-    .box { margin-top: 20px; }
-    textarea { width: 100%; background: #2c2c2e; color: #30d158; border: 1px solid #333; padding: 10px; min-height: 200px; font-family: monospace; border-radius: 6px; }
-    h3 { border-bottom: 1px solid #333; padding-bottom: 5px; color: #0a84ff; }
-    .die-list { max-height: 300px; overflow-y: auto; background: #1a1a1a; border: 1px solid #333; padding: 10px; border-radius: 6px; }
-    .die-item { font-size: 12px; border-bottom: 1px dashed #333; padding: 4px 0; color: #aaa; }
-    button { padding: 8px 16px; background: #0a84ff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 5px; }
-    button:hover { opacity: 0.8; }
+        body { background: #121212; color: #e9ecef; font-family: monospace; padding: 20px; }
+        h2 { color: #5a7dff; border-bottom: 1px solid #333; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+        a { color: #5a7dff; text-decoration: none; font-size: 16px; }
+        a:hover { text-decoration: underline; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #333; padding: 10px; text-align: left; }
+        th { background: #1c1c1e; color: #adb5bd; }
+        tr:hover { background: #1c1c1e; }
+        button { cursor: pointer; padding: 6px 12px; background: #dc3545; color: white; border: none; border-radius: 4px; font-weight: bold; }
+        .tools-bar { display: flex; gap: 10px; margin-bottom: 15px; align-items: center; }
+        input[type="text"] { padding: 8px; border-radius: 4px; border: 1px solid #444; background: #222; color: #fff; width: 300px; }
+        
+        /* Box chức năng lấy hàng mới */
+        .fetch-box {
+            background: #1e1e24; border: 1px dashed #20c997; padding: 15px; 
+            border-radius: 8px; margin-bottom: 20px; display: flex; align-items: center; gap: 15px;
+        }
     </style>
 </head>
 <body>
-    <h2>🚀 Checking Progress...</h2>
+
+    <h2>
+        <span>📦 Group: {{ group }} ({{ items|length }} items)</span>
+        <div>
+             <a href="{{ url_for('admin_local_stock_download', group=group) }}" style="margin-right: 15px; font-size: 14px; background:#20c997; color:#000; padding:4px 8px; border-radius:4px; text-decoration:none;">📥 Tải File TXT</a>
+             <a href="{{ url_for('admin_local_history_view') }}?group={{ group }}" style="margin-right: 15px; font-size: 14px;">📜 Xem Lịch Sử</a>
+             <form action="{{ url_for('admin_local_stock_dedup') }}" method="post" style="display:inline;" onsubmit="return confirm('Bạn có chắc muốn xóa các dòng trùng lặp?');">
+                <input type="hidden" name="group_name" value="{{ group }}">
+                <button style="background: #ffc107; color: #000;">🧹 Quét Trùng</button>
+             </form>
+        </div>
+    </h2>
+
+    <div class="fetch-box">
+        <strong style="color: #20c997; font-size: 16px;">🚀 Lấy hàng nhanh (Fetch & Delete):</strong>
+        <form action="{{ url_for('admin_local_stock_fetch_manual') }}" method="post" target="_blank" style="display: flex; align-items: center; gap: 10px; margin: 0;">
+            <input type="hidden" name="group_name" value="{{ group }}">
+            <input type="number" name="quantity" value="1" min="1" placeholder="Số lượng" required style="width: 100px; padding: 8px; background: #000; color: #fff; border: 1px solid #444; border-radius: 4px;">
+            <button type="submit" style="background: #0d6efd; padding: 9px 15px;">Lấy ngay & Copy</button>
+        </form>
+        <span style="font-size: 12px; color: #aaa;">(Hành động này sẽ xóa hàng khỏi kho và lưu vào lịch sử)</span>
+    </div>
+    <div class="tools-bar">
+        <a href="{{ url_for('admin_index') }}#local-stock">🔙 Quay lại Dashboard</a>
+        <form method="get" style="margin-left: auto;">
+            <input type="hidden" name="group" value="{{ group }}">
+            <input type="text" name="q" placeholder="Tìm kiếm acc..." value="{{ request.args.get('q', '') }}">
+            <button type="submit" style="background: #6c757d;">Tìm</button>
+        </form>
+    </div>
+
+    <table>
+        <thead>
+            <tr>
+                <th style="width: 50px;">STT</th>
+                <th>Nội dung (Tài khoản/Key)</th>
+                <th style="width: 200px;">Ngày thêm (VN)</th>
+                <th style="width: 100px;">Hành động</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for i in items %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td style="word-break: break-all; color: #20c997;">{{ i.content }}</td>
+                <td>{{ i.added_at }}</td>
+                <td>
+                    <form action="{{ url_for('admin_local_stock_delete_one') }}" method="post" onsubmit="return confirm('Xóa dòng này?');">
+                        <input type="hidden" name="id" value="{{ i.id }}">
+                        <input type="hidden" name="group" value="{{ group }}">
+                        <button type="submit">Xóa</button>
+                    </form>
+                </td>
+            </tr>
+        {% else %}
+            <tr>
+                <td colspan="4" style="text-align: center; padding: 30px; color: #adb5bd;">
+                    Không tìm thấy dữ liệu phù hợp.
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------------------------
+# 7.4 TEMPLATE LỊCH SỬ LẤY HÀNG (HISTORY_VIEW_TPL)
+# ------------------------------------------------------------------------------
+HISTORY_VIEW_TPL = """
+<!doctype html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <title>Lịch sử lấy hàng</title>
+    <style>
+        body { background: #121212; color: #e9ecef; font-family: monospace; padding: 20px; }
+        h2 { color: #a0a0ff; border-bottom: 1px solid #333; padding-bottom: 10px; }
+        a { color: #5a7dff; text-decoration: none; font-size: 16px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #333; padding: 10px; text-align: left; }
+        th { background: #1c1c1e; color: #adb5bd; }
+        tr:hover { background: #1c1c1e; }
+    </style>
+</head>
+<body>
+    <h2>📜 Lịch Sử Xuất Kho ({{ group if group else 'Tất Cả' }})</h2>
+    <a href="{{ url_for('admin_local_stock_view', group=group) if group else url_for('admin_index') }}">🔙 Quay lại</a>
+
+    <table>
+        <thead>
+            <tr>
+                <th style="width: 50px;">ID</th>
+                <th>Group</th>
+                <th>Nội dung đã lấy</th>
+                <th style="width: 200px;">Thời gian lấy (VN)</th>
+            </tr>
+        </thead>
+        <tbody>
+        {% for i in items %}
+            <tr>
+                <td>{{ i.id }}</td>
+                <td>{{ i.group_name }}</td>
+                <td style="word-break: break-all; color: #ffc107;">{{ i.content }}</td>
+                <td>{{ i.fetched_at }}</td>
+            </tr>
+        {% else %}
+            <tr><td colspan="4" style="text-align: center; padding: 30px; color: #adb5bd;">Chưa có lịch sử nào.</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------------------------
+# 7.5 TEMPLATE KẾT QUẢ LẤY HÀNG (FETCH_RESULT_TPL - MỚI)
+# ------------------------------------------------------------------------------
+FETCH_RESULT_TPL = """
+<!doctype html>
+<html data-theme="dark">
+<head>
+    <meta charset="utf-8" />
+    <title>Kết quả lấy hàng</title>
+    <style>
+        body { background: #121212; color: #e9ecef; font-family: monospace; padding: 20px; text-align: center; }
+        h3 { color: #20c997; }
+        textarea { 
+            width: 100%; max-width: 800px; height: 300px; 
+            background: #1c1c1e; color: #5a7dff; 
+            border: 1px solid #333; padding: 15px; border-radius: 8px;
+            font-size: 14px; margin-bottom: 15px;
+        }
+        .btn { padding: 10px 20px; background: #5a7dff; color: white; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; }
+        .info { color: #adb5bd; font-size: 13px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <h3>✅ Đã lấy thành công {{ count }} items từ nhóm [{{ group }}]</h3>
+    <p class="info">Dữ liệu đã được lưu vào lịch sử và xóa khỏi kho hiện tại.</p>
     
-    <div class="stats">
-        <span id="st">Status: Starting...</span>
-        <span class="live" id="cl">LIVE: 0</span>
-        <span class="die" id="cd">DIE: 0</span>
-    </div>
-    <div id="msg" style="color:#aaa;margin-bottom:10px">Initializing threads...</div>
-
-    <div class="box">
-        <h3 class="live">✅ LIVE ACCOUNTS (Clean List)</h3>
-        <textarea id="live_area" readonly></textarea>
-        <button onclick="copyLive()">📋 COPY ALL LIVE</button>
-    </div>
-
-    <div class="box">
-        <h3 class="die">❌ DIE / ERROR DETAILS</h3>
-        <div id="die_list" class="die-list"></div>
-    </div>
+    <textarea id="result_box" readonly>{{ content }}</textarea>
+    <br>
+    <p id="status_msg" style="color: #ffc107; font-weight: bold; height: 20px;"></p>
+    
+    <button onclick="copyToClipboard()" class="btn">📋 Copy Lại</button>
+    <button onclick="window.close()" class="btn" style="background: #dc3545; margin-left: 10px;">Đóng</button>
 
     <script>
-        function update(done, total, live, die) {
-            document.getElementById('st').innerText = `Checked: ${done}/${total}`;
-            document.getElementById('cl').innerText = `LIVE: ${live}`;
-            document.getElementById('cd').innerText = `DIE: ${die}`;
+        function copyToClipboard() {
+            var copyText = document.getElementById("result_box");
+            copyText.select();
+            copyText.setSelectionRange(0, 99999); /* For mobile devices */
+            
+            // Thử dùng API hiện đại
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(copyText.value).then(function() {
+                    document.getElementById("status_msg").innerText = "Đã tự động COPY vào bộ nhớ tạm!";
+                }, function(err) {
+                    document.getElementById("status_msg").innerText = "Lỗi Copy tự động. Hãy bấm nút Copy Lại.";
+                });
+            } else {
+                // Fallback cũ
+                document.execCommand("copy");
+                document.getElementById("status_msg").innerText = "Đã tự động COPY vào bộ nhớ tạm!";
+            }
         }
-        function addLive(line) {
-            // Chỉ thêm username sạch vào box để copy dễ
-            let user = line.split('|')[0].trim();
-            let area = document.getElementById('live_area');
-            area.value += user + "\\n";
-        }
-        function addDie(line, reason) {
-            let list = document.getElementById('die_list');
-            let item = document.createElement('div');
-            item.className = 'die-item';
-            // Không hiện timestamp
-            item.innerHTML = `<span style='color:#ff453a'>[DIE]</span> ${line} <span style='color:#666'>(${reason})</span>`;
-            list.appendChild(item);
-        }
-        function copyLive() {
-            let area = document.getElementById('live_area');
-            area.select();
-            document.execCommand('copy');
-            alert("Đã copy danh sách LIVE (chỉ username)!");
-        }
-        function done() {
-            document.querySelector('h2').innerText = "✅ CHECK COMPLETED!";
-            document.querySelector('h2').style.color = "#30d158";
-            document.getElementById('msg').innerText = "Done.";
-        }
+        // Tự động chạy khi load trang
+        window.onload = function() {
+            setTimeout(copyToClipboard, 500);
+        };
     </script>
+</body>
+</html>
 """
 
 
 # ==============================================================================
-#   PHẦN 8: FLASK ROUTES
+# ==============================================================================
+#
+#   PHẦN 8: FLASK ROUTES & CONTROLLERS (XỬ LÝ REQUEST)
+#
+# ==============================================================================
 # ==============================================================================
 
 def find_map_by_key(key: str):
-    with db() as con: return con.execute("SELECT * FROM keymaps WHERE input_key=? AND is_active=1", (key,)).fetchone()
+    """Tìm kiếm thông tin sản phẩm dựa trên Input Key"""
+    with db() as con:
+        row = con.execute("SELECT * FROM keymaps WHERE input_key=? AND is_active=1", (key,)).fetchone()
+        return row
 
 def require_admin():
-    if request.cookies.get("logged_in") != ADMIN_SECRET: abort(redirect(url_for('login')))
+    """Middleware kiểm tra quyền Admin"""
+    if request.cookies.get("logged_in") != ADMIN_SECRET:
+        abort(redirect(url_for('login')))
 
-# --- AUTH ---
 @app.route("/", methods=["GET", "POST"])
 def login():
+    """Trang đăng nhập"""
     if request.method == "POST":
-        if request.form.get("admin_secret") == ADMIN_SECRET:
-            resp = make_response(redirect(url_for("admin_index")))
-            resp.set_cookie("logged_in", ADMIN_SECRET, max_age=31536000)
-            return resp
-        flash("Sai mật khẩu!")
-    if request.cookies.get("logged_in") == ADMIN_SECRET: return redirect(url_for("admin_index"))
+        secret = request.form.get("admin_secret")
+        if secret == ADMIN_SECRET:
+            response = make_response(redirect(url_for("admin_index")))
+            # Cookie sống 1 năm
+            response.set_cookie("logged_in", ADMIN_SECRET, max_age=31536000, httponly=True, secure=True, samesite='Lax')
+            return response
+        else:
+            flash("Mật khẩu Admin không chính xác. Vui lòng thử lại.", "error")
+            return render_template_string(LOGIN_TPL)
+    
+    # Nếu đã login thì chuyển thẳng vào admin
+    if request.cookies.get("logged_in") == ADMIN_SECRET:
+        return redirect(url_for("admin_index"))
+        
     return render_template_string(LOGIN_TPL)
 
 @app.route("/logout", methods=["POST"])
 def logout():
-    resp = make_response(redirect(url_for("login")))
-    resp.set_cookie("logged_in", "", max_age=0); return resp
+    """Đăng xuất"""
+    response = make_response(redirect(url_for("login")))
+    response.set_cookie("logged_in", "", max_age=0) 
+    return response
 
-# --- ADMIN ---
 @app.route("/admin")
 def admin_index():
-    require_admin()
-    with db() as con:
-        stock = con.execute("SELECT group_name, COUNT(*) as c FROM local_stock GROUP BY group_name").fetchall()
-    return render_template_string(ADMIN_TPL, 
-        current_proxy=CURRENT_PROXY_STRING,
-        local_groups=[r['group_name'] for r in stock],
-        local_stats={r['group_name']: r['c'] for r in stock}
-    )
+    """Trang Dashboard chính"""
+    require_admin() 
 
-# --- KEYMAP ---
+    with db() as con:
+        # 1. Lấy danh sách Keymaps
+        maps = con.execute("SELECT * FROM keymaps ORDER BY group_name, provider_type, sku, id").fetchall()
+        
+        # Gom nhóm dữ liệu: Website -> Provider -> Key List
+        # SỬ DỤNG LIST ĐỂ ĐẢM BẢO HIỂN THỊ ĐỦ TẤT CẢ KEY
+        grouped_data = {}
+        for key in maps:
+            folder = key['group_name'] or 'DEFAULT' 
+            provider = key['provider_type']
+            
+            if folder not in grouped_data:
+                grouped_data[folder] = {}
+            
+            if provider not in grouped_data[folder]:
+                grouped_data[folder][provider] = [] # Khởi tạo là List
+            
+            grouped_data[folder][provider].append(key) # Append vào list
+        
+        # 2. Lấy danh sách Proxy (Để hiển thị bảng)
+        proxies = con.execute("SELECT * FROM proxies ORDER BY is_live DESC, latency ASC").fetchall()
+
+        # 3. Lấy cấu hình Ping
+        ping_url = con.execute("SELECT value FROM config WHERE key='ping_url'").fetchone()
+        ping_int = con.execute("SELECT value FROM config WHERE key='ping_interval'").fetchone()
+        ping_config = {
+            "url": ping_url['value'] if ping_url else "", 
+            "interval": ping_int['value'] if ping_int else 300
+        }
+
+        # 4. Lấy thống kê Local Stock
+        stock_rows = con.execute("SELECT group_name, COUNT(*) as cnt FROM local_stock GROUP BY group_name").fetchall()
+        local_stats = {r['group_name']: r['cnt'] for r in stock_rows}
+        
+        # Tạo danh sách group để gợi ý input
+        local_groups = [r['group_name'] for r in stock_rows]
+
+    # Lấy setting giao diện từ Cookie
+    effect = request.cookies.get('admin_effect', 'astronaut')
+    mode = request.cookies.get('admin_mode', 'dark') 
+    
+    return render_template_string(ADMIN_TPL, 
+                                  grouped_data=grouped_data, 
+                                  proxies=proxies, 
+                                  current_proxy=CURRENT_PROXY_STRING, 
+                                  ping=ping_config, 
+                                  local_stats=local_stats,
+                                  local_groups=local_groups,
+                                  effect=effect,
+                                  mode=mode)
+
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ KEYMAP
+# ------------------------------------------------------------------------------
 @app.route("/admin/keymap", methods=["POST"])
 def admin_add_keymap():
-    require_admin(); f=request.form
-    with db() as con: 
-        con.execute("INSERT OR REPLACE INTO keymaps(group_name,sku,input_key,product_id,api_key,is_active,provider_type,base_url) VALUES(?,?,?,?,?,1,?,?)", 
-        (f.get("group_name"),f.get("sku"),f.get("input_key"),f.get("product_id") or 0,f.get("api_key"),f.get("provider_type"),f.get("base_url")))
-        con.commit()
+    require_admin()
+    f = request.form
+    
+    group_name = f.get("group_name", "").strip()
+    sku = f.get("sku", "").strip()
+    input_key = f.get("input_key", "").strip()
+    product_id = f.get("product_id", "").strip()
+    provider_type = f.get("provider_type", "").strip()
+    base_url = f.get("base_url", "").strip()
+    api_key = f.get("api_key", "").strip()
+    
+    if not input_key or not provider_type:
+        flash("Lỗi: Thiếu thông tin bắt buộc.", "error")
+        return redirect(url_for("admin_index"))
+    
+    # FIX: Nếu local thì id = 0, để tránh lỗi
+    if provider_type == 'local': 
+        product_id = 0
+        
+    try:
+        with db() as con:
+            con.execute("""
+                INSERT INTO keymaps(group_name, sku, input_key, product_id, api_key, is_active, provider_type, base_url)
+                VALUES(?,?,?,?,?,1,?,?)
+                ON CONFLICT(input_key) DO UPDATE SET
+                  group_name=excluded.group_name,
+                  sku=excluded.sku,
+                  product_id=excluded.product_id,
+                  api_key=excluded.api_key,
+                  provider_type=excluded.provider_type,
+                  base_url=excluded.base_url,
+                  is_active=1
+            """, (group_name, sku, input_key, product_id, api_key, provider_type, base_url))
+            con.commit()
+        flash(f"Đã lưu key '{input_key}' thành công!", "success")
+    except Exception as e:
+        flash(f"Lỗi Database: {e}", "error")
+        
     return redirect(url_for("admin_index"))
 
-# --- PROXY ---
-@app.route("/admin/proxy/add", methods=["POST"])
-def admin_add_proxy():
-    require_admin(); p=request.form.get("proxies","")
+# Route xử lý thêm key hàng loạt cho Local
+@app.route("/admin/keymap/bulk", methods=["POST"])
+def admin_add_keymap_bulk():
+    require_admin()
+    f = request.form
+    grp = f.get("group_name", "").strip()
+    prefix = f.get("sku_prefix", "").strip()
+    keys_raw = f.get("bulk_keys", "").strip()
+    
+    if not grp or not keys_raw:
+        flash("Thiếu tên Group hoặc danh sách Key", "error")
+        return redirect(url_for("admin_index"))
+    
+    cnt = 0
     with db() as con:
-        for l in p.splitlines(): 
-            if l.strip(): con.execute("INSERT OR IGNORE INTO proxies(proxy_string) VALUES(?)", (l.strip(),))
+        for k in keys_raw.split('\n'):
+            k = k.strip()
+            if k:
+                sku = f"{prefix}{k}" if prefix else k
+                try:
+                    con.execute("""
+                        INSERT INTO keymaps(group_name, sku, input_key, product_id, is_active, provider_type, base_url, api_key)
+                        VALUES(?,?,?,0,1,'local','','')
+                        ON CONFLICT(input_key) DO NOTHING
+                    """, (grp, sku, k))
+                    cnt += 1
+                except:
+                    pass
         con.commit()
+    flash(f"Đã thêm {cnt} key hàng loạt vào nhóm '{grp}'", "success")
     return redirect(url_for("admin_index"))
 
-# --- LOCAL STOCK ---
+@app.route("/admin/keymap/delete/<int:kmid>", methods=["POST"])
+def admin_delete_key(kmid):
+    require_admin()
+    with db() as con:
+        con.execute("DELETE FROM keymaps WHERE id=?", (kmid,))
+        con.commit()
+    flash("Đã xóa key thành công.", "success")
+    return redirect(url_for("admin_index"))
+
+@app.route("/admin/keymap/toggle/<int:kmid>", methods=["POST"])
+def admin_toggle_key(kmid):
+    require_admin()
+    with db() as con:
+        row = con.execute("SELECT is_active FROM keymaps WHERE id=?", (kmid,)).fetchone()
+        if row:
+            new_val = 0 if row['is_active'] else 1
+            con.execute("UPDATE keymaps SET is_active=? WHERE id=?", (new_val, kmid))
+            con.commit()
+    return redirect(url_for("admin_index"))
+
+
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ LOCAL STOCK (ĐÃ CÓ SỐ THỨ TỰ CHUẨN & TÌM KIẾM & DEDUP)
+# ------------------------------------------------------------------------------
 @app.route("/admin/local-stock/add", methods=["POST"])
 def admin_local_stock_add():
-    require_admin(); g=request.form.get("group_name"); f=request.files.get("stock_file")
-    if f: 
-        lines = f.read().decode('utf-8', errors='ignore').splitlines()
+    require_admin()
+    grp = request.form.get("group_name", "").strip()
+    content = request.form.get("content", "").strip()
+    file = request.files.get("stock_file")
+    
+    if not grp:
+        flash("Thiếu tên Group.", "error")
+        return redirect(url_for("admin_index") + "#local-stock")
+    
+    lines = []
+    # Ưu tiên đọc file TXT
+    if file and file.filename:
+        try:
+            lines = file.read().decode('utf-8', errors='ignore').splitlines()
+        except Exception as e:
+            flash(f"Lỗi đọc file: {e}", "error")
+            return redirect(url_for("admin_index") + "#local-stock")
+    # Nếu không có file thì đọc từ ô text
+    elif content:
+        lines = content.split('\n')
+    
+    count = 0
+    if lines:
         with db() as con:
-            for l in lines: 
-                if l.strip():
-                    con.execute("INSERT INTO local_stock(group_name, content, added_at) VALUES(?,?,?)", 
-                               (grp, l.strip(), get_vn_time()))
+            now = get_vn_time() # Dùng giờ Việt Nam
+            for line in lines:
+                line = line.strip()
+                if line:
+                    con.execute("INSERT INTO local_stock(group_name, content, added_at) VALUES(?,?,?)", (grp, line, now))
+                    count += 1
             con.commit()
+        
+    flash(f"Đã thêm {count} dòng vào kho '{grp}'.", "success")
     return redirect(url_for("admin_index") + "#local-stock")
 
 @app.route("/admin/local-stock/view")
 def admin_local_stock_view():
     require_admin()
     grp = request.args.get("group")
+    query = request.args.get("q", "").strip() # Lấy từ khóa tìm kiếm
+    
     with db() as con:
-        items = con.execute("SELECT * FROM local_stock WHERE group_name=?", (grp,)).fetchall()
-    return render_template_string(STOCK_VIEW_TPL, group=grp, items=items)
+        if query:
+            # Tìm kiếm gần đúng (LIKE)
+            items = con.execute("SELECT * FROM local_stock WHERE group_name=? AND content LIKE ?", (grp, f"%{query}%")).fetchall()
+        else:
+            items = con.execute("SELECT * FROM local_stock WHERE group_name=?", (grp,)).fetchall()
+            
+    return render_template_string(STOCK_VIEW_TPL, group=grp, items=items, request=request)
 
 @app.route("/admin/local-stock/download")
 def admin_local_stock_download():
@@ -661,192 +1758,192 @@ def admin_local_stock_download():
     grp = request.args.get("group")
     with db() as con:
         rows = con.execute("SELECT content FROM local_stock WHERE group_name=?", (grp,)).fetchall()
-    resp = make_response("\n".join([r['content'] for r in rows]))
-    resp.headers["Content-Disposition"] = f"attachment; filename=stock_{quote(grp)}.txt"
+    
+    # Xuất ra file .txt, mỗi dòng là 1 content
+    out = "\n".join([r['content'] for r in rows])
+    resp = make_response(out)
+    resp.headers["Content-Disposition"] = f"attachment; filename=stock_{grp}.txt"
     resp.headers["Content-Type"] = "text/plain"
     return resp
 
-@app.route("/admin/local-stock/quick-get")
-def admin_local_stock_quick_get():
+@app.route("/admin/local-history/view")
+def admin_local_history_view():
     require_admin()
     grp = request.args.get("group")
-    try: qty = int(request.args.get("qty", 1))
-    except: return "Invalid Qty", 400
-    
-    items = fetch_local_stock(grp, qty)
-    return "\n".join([i['product'] for i in items]), 200, {'Content-Type':'text/plain'}
+    with db() as con:
+        if grp:
+            items = con.execute("SELECT * FROM local_history WHERE group_name=? ORDER BY id DESC LIMIT 500", (grp,)).fetchall()
+        else:
+            items = con.execute("SELECT * FROM local_history ORDER BY id DESC LIMIT 500").fetchall()
+    return render_template_string(HISTORY_VIEW_TPL, group=grp, items=items)
+
+@app.route("/admin/local-stock/dedup", methods=["POST"])
+def admin_local_stock_dedup():
+    require_admin()
+    grp = request.form.get("group_name")
+    with db() as con:
+        # Xóa các dòng trùng lặp, chỉ giữ lại dòng có ID nhỏ nhất
+        con.execute("""
+            DELETE FROM local_stock 
+            WHERE group_name=? 
+            AND id NOT IN (
+                SELECT MIN(id) 
+                FROM local_stock 
+                WHERE group_name=? 
+                GROUP BY content
+            )
+        """, (grp, grp))
+        con.commit()
+    flash(f"Đã quét trùng xong cho nhóm {grp}.", "success")
+    return redirect(url_for("admin_local_stock_view", group=grp))
 
 @app.route("/admin/local-stock/delete-one", methods=["POST"])
 def admin_local_stock_delete_one():
     require_admin()
+    mid = request.form.get("id")
+    grp = request.form.get("group")
     with db() as con:
-        con.execute("DELETE FROM local_stock WHERE id=?", (request.form.get("id"),))
+        con.execute("DELETE FROM local_stock WHERE id=?", (mid,))
         con.commit()
-    return redirect(url_for("admin_local_stock_view", group=request.form.get("group")))
+    return redirect(url_for("admin_local_stock_view", group=grp))
 
 @app.route("/admin/local-stock/clear", methods=["POST"])
 def admin_local_stock_clear():
     require_admin()
+    grp = request.form.get("group_name")
     with db() as con:
-        con.execute("DELETE FROM local_stock WHERE group_name=?", (request.form.get("group_name"),))
+        con.execute("DELETE FROM local_stock WHERE group_name=?", (grp,))
         con.commit()
+    flash(f"Đã xóa sạch kho '{grp}'.", "success")
     return redirect(url_for("admin_index") + "#local-stock")
 
-
-# ==============================================================================
-#   PHẦN 9: TIKTOK CHECKER CORE (LOGIC TỪ CHECKTIKTOK_PATCHED.PY)
-# ==============================================================================
-
-def check_tiktok_advanced(line, proxy_iter):
+# ROUTE MỚI: XỬ LÝ LẤY HÀNG THỦ CÔNG & HIỂN THỊ KẾT QUẢ
+@app.route("/admin/local-stock/fetch-manual", methods=["POST"])
+def admin_local_stock_fetch_manual():
     """
-    Check Live/Die chuẩn xác (tương tự tool Python):
-    - Sử dụng BeautifulSoup để phân tích cấu trúc trang nếu có thể.
-    - Check DIE dựa trên thông báo lỗi cụ thể.
-    - Check LIVE dựa trên việc KHÔNG PHẢI DIE (kể cả Captcha/Private).
+    API lấy hàng thủ công từ Admin Dashboard.
+    1. Lấy N items.
+    2. Lưu vào lịch sử.
+    3. Xóa khỏi kho.
+    4. Trả về trang kết quả để auto copy.
     """
-    line = line.strip()
-    if not line: return None
-    
-    parts = line.split('|') if '|' in line else line.split()
-    user_id = parts[0].strip().replace("@", "")
-    if not user_id: return None
-    
-    url = f"https://www.tiktok.com/@{user_id}"
-    
-    # Headers giả lập Chrome xịn
-    headers = {
-        'User-Agent': UA_STRING,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        'Sec-Ch-Ua-Mobile': '?0',
-        'Sec-Ch-Ua-Platform': '"Windows"',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Sec-Fetch-User': '?1',
-        'Upgrade-Insecure-Requests': '1',
-        'Referer': 'https://www.tiktok.com/'
-    }
-    
-    # Proxy Rotation
-    prx = None
-    if proxy_iter:
-        try: prx = next(proxy_iter)
-        except: pass
-    proxies = format_proxy_url(prx) if prx else CURRENT_PROXY_SET
-    
-    try:
-        # Timeout 15s
-        r = requests.get(url, headers=headers, proxies=proxies, timeout=15)
-        
-        # 1. Check DIE cứng (404 Not Found)
-        if r.status_code == 404:
-            return ("DIE", line, "404 Not Found")
-            
-        html = r.text
-        
-        # 2. Check DIE mềm (200 OK nhưng nội dung báo không tồn tại)
-        if "Couldn't find this account" in html or \
-           "Không thể tìm thấy tài khoản này" in html or \
-           "user-not-found" in html:
-            return ("DIE", line, "Not Found (HTML)")
-            
-        # 3. Mọi trường hợp còn lại -> LIVE (An toàn)
-        
-        # Nếu có BS4 thì parse thử lấy thông tin (để xác nhận chắc chắn Live)
-        info = ""
-        if BeautifulSoup:
-            try:
-                soup = BeautifulSoup(html, 'lxml')
-                # Tìm data JSON
-                script_tag = soup.find('script', id='__UNIVERSAL_DATA_FOR_REHYDRATION__')
-                if script_tag and script_tag.string:
-                    data = json.loads(script_tag.string)
-                    stats = data['__DEFAULT_SCOPE__']['webapp.user-detail']['userInfo']['stats']
-                    info = f" | Follow: {stats.get('followerCount',0)}"
-            except: pass
-
-        if "captcha" in html.lower() or "verify" in html.lower():
-            return ("LIVE", line, "Live (Captcha)")
-            
-        if "private" in html.lower():
-            return ("LIVE", line, "Live (Private)")
-            
-        return ("LIVE", line, "OK" + info)
-        
-    except Exception as e:
-        # Lỗi mạng -> Coi như Live (để ko xóa nhầm)
-        return ("LIVE", line, f"Error/Timeout")
-
-@app.route("/admin/checker/run", methods=["POST"])
-def admin_run_checker():
     require_admin()
+    grp = request.form.get("group_name")
+    qty = int(request.form.get("quantity", 1))
     
-    # Lấy input
-    raw_list = request.form.get("check_list", "")
-    local_group = request.form.get("local_group", "")
-    raw_proxies = request.form.get("check_proxies", "").strip()
+    # Sử dụng lại hàm fetch_local_stock có sẵn ở Phần 6
+    # Hàm này ĐÃ bao gồm logic: Lấy -> Lưu History -> Xóa Stock
+    items = fetch_local_stock(grp, qty)
     
-    try: threads = int(request.form.get("threads", 10))
-    except: threads = 10
-    
-    # Chuẩn bị Data
-    lines = []
-    if local_group:
-        with db() as con:
-            rows = con.execute("SELECT content FROM local_stock WHERE group_name=?", (local_group,)).fetchall()
-            lines = [r['content'] for r in rows]
-    else:
-        lines = [l for l in raw_list.splitlines() if l.strip()]
-        
-    if not lines: return "<h3>Không có dữ liệu để check.</h3>", 400
-        
-    # Chuẩn bị Proxy
-    proxy_list = [p.strip() for p in raw_proxies.splitlines() if p.strip()]
-    if not proxy_list:
-        with db() as con: proxy_list = [r['proxy_string'] for r in con.execute("SELECT proxy_string FROM proxies WHERE is_live=1").fetchall()]
-    
-    proxy_iter = itertools.cycle(proxy_list) if proxy_list else None
-    
-    # Generator Stream Response
-    def generate():
-        yield CHECKER_STREAM_TPL
-        total = len(lines)
-        done = 0
-        live = 0
-        die = 0
-        
-        # Chạy Đa Luồng
-        with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = {executor.submit(check_tiktok_advanced, line, proxy_iter): line for line in lines}
-            
-            for future in concurrent.futures.as_completed(futures):
-                res = future.result()
-                if res:
-                    status, line, reason = res
-                    done += 1
-                    
-                    safe_line = json.dumps(line)
-                    safe_reason = json.dumps(reason)
-                    
-                    if status == "LIVE":
-                        live += 1
-                        yield f"<script>addLive({safe_line}); update({done}, {total}, {live}, {die});</script>\n"
-                    else:
-                        die += 1
-                        yield f"<script>addDie({safe_line}, {safe_reason}); update({done}, {total}, {live}, {die});</script>\n"
-                else:
-                    done += 1
-                    yield f"<script>update({done}, {total}, {live}, {die});</script>\n"
-                    
-        yield "<script>done();</script></body></html>"
+    if not items:
+        return "<h3 style='color:white; background:black; padding:20px; font-family:sans-serif;'>❌ Kho hàng không đủ số lượng hoặc đã hết!</h3>"
 
-    return Response(stream_with_context(generate()))
+    # Chuẩn bị dữ liệu để hiển thị
+    content_list = [i['product'] for i in items]
+    content_str = "\n".join(content_list)
+    
+    # Render ra trang kết quả (mở tab mới)
+    return render_template_string(FETCH_RESULT_TPL, content=content_str, count=len(items), group=grp)
+
+
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ PROXY
+# ------------------------------------------------------------------------------
+@app.route("/admin/proxy/add", methods=["POST"])
+def admin_add_proxy():
+    require_admin()
+    blob = request.form.get("proxies", "").strip()
+    count = 0
+    
+    with db() as con:
+        for line in blob.split('\n'):
+            line = line.strip()
+            if line:
+                con.execute("INSERT OR IGNORE INTO proxies (proxy_string, is_live, last_checked) VALUES (?, 0, ?)", (line, get_vn_time()))
+                count += 1
+        con.commit()
+        
+        if not CURRENT_PROXY_STRING:
+            select_best_available_proxy(con)
+            
+    flash(f"Đã thêm {count} proxy vào hệ thống.", "success")
+    return redirect(url_for("admin_index"))
+
+@app.route("/admin/proxy/delete", methods=["POST"])
+def admin_delete_proxy():
+    require_admin()
+    with db() as con:
+        con.execute("DELETE FROM proxies WHERE id=?", (request.form.get("id"),))
+        con.commit()
+    return redirect(url_for("admin_index"))
+
+
+# ------------------------------------------------------------------------------
+# ROUTES: QUẢN LÝ PING (ANTI-SLEEP)
+# ------------------------------------------------------------------------------
+@app.route("/admin/ping/save", methods=["POST"])
+def admin_save_ping():
+    require_admin()
+    url = request.form.get("ping_url", "").strip()
+    interval = request.form.get("ping_interval", "300").strip()
+    
+    with db() as con:
+        con.execute("INSERT OR REPLACE INTO config(key,value) VALUES('ping_url', ?)", (url,))
+        con.execute("INSERT OR REPLACE INTO config(key,value) VALUES('ping_interval', ?)", (interval,))
+        con.commit()
+        
+    flash("Đã lưu cấu hình Ping Service.", "success")
+    return redirect(url_for("admin_index"))
+
+
+# ------------------------------------------------------------------------------
+# ROUTES: BACKUP & RESTORE
+# ------------------------------------------------------------------------------
+@app.route("/admin/backup/download")
+def admin_backup_download():
+    require_admin()
+    perform_backup_to_file()
+    if os.path.exists(AUTO_BACKUP_FILE):
+        with open(AUTO_BACKUP_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            data['export_time'] = get_vn_time()
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            response = jsonify(data)
+            response.headers['Content-Disposition'] = f'attachment; filename=full_backup_{timestamp}.json'
+            return response
+    return "Chưa có dữ liệu backup.", 404
+
+@app.route("/admin/backup/upload", methods=["POST"])
+def admin_backup_upload():
+    require_admin()
+    file = request.files.get('backup_file')
+    if file and file.filename.endswith('.json'):
+        try:
+            data = json.load(file)
+            with db() as con:
+                con.execute("DELETE FROM keymaps"); con.execute("DELETE FROM proxies"); con.execute("DELETE FROM local_stock")
+                
+                kms = data.get('keymaps', []) if isinstance(data, dict) else data
+                pxs = data.get('proxies', []) if isinstance(data, dict) else []
+                lcs = data.get('local_stock', []) if isinstance(data, dict) else []
+                cfg = data.get('config', {}) if isinstance(data, dict) else {}
+
+                for k in kms: con.execute("INSERT INTO keymaps(sku,input_key,product_id,is_active,group_name,provider_type,base_url,api_key) VALUES(?,?,?,?,?,?,?,?)", (k.get('sku'), k.get('input_key'), k.get('product_id'), k.get('is_active',1), k.get('group_name'), k.get('provider_type'), k.get('base_url'), k.get('api_key')))
+                for p in pxs: con.execute("INSERT OR IGNORE INTO proxies(proxy_string, is_live, latency, last_checked) VALUES(?,?,?,?)", (p.get('proxy_string'), 0, 9999.0, get_vn_time()))
+                for l in lcs: con.execute("INSERT INTO local_stock(group_name, content, added_at) VALUES(?,?,?)", (l.get('group_name'), l.get('content'), l.get('added_at')))
+                for k, v in cfg.items(): con.execute("INSERT OR REPLACE INTO config(key,value) VALUES(?,?)", (k, str(v)))
+                con.commit()
+            flash("Restore thành công", "success")
+        except Exception as e: flash(f"Lỗi khôi phục: {e}", "error")
+    return redirect(url_for("admin_index"))
 
 
 # ==============================================================================
-#   PHẦN 10: PUBLIC API (CHO NGƯỜI MUA)
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 9: PUBLIC API (CHO NGƯỜI MUA)
+#
+# ------------------------------------------------------------------------------
 # ==============================================================================
 
 @app.route("/stock")
@@ -859,33 +1956,59 @@ def stock():
 
 @app.route("/fetch")
 def fetch():
-    key = request.args.get("key", "").strip(); qty = int(request.args.get("quantity", 0))
-    with db() as con: row = find_map_by_key(key)
-    if not row or qty <= 0: return jsonify([])
+    key = request.args.get("key", "").strip(); qty_s = request.args.get("quantity", "").strip()
+    try: qty = int(qty_s)
+    except: return jsonify([])
+    row = find_map_by_key(key)
+    if not row or qty<=0: return jsonify([])
     if row['provider_type']=='local': return jsonify(fetch_local_stock(row['group_name'], qty))
     return fetch_mail72h_format(row, qty)
 
 @app.route("/health")
-def health(): return "OK", 200
+def health():
+    return "OK", 200
 
 
 # ==============================================================================
-#   PHẦN 11: KHỞI ĐỘNG (STARTUP SEQUENCE)
+# ------------------------------------------------------------------------------
+#
+#   PHẦN 10: KHỞI ĐỘNG (STARTUP)
+#
+# ------------------------------------------------------------------------------
 # ==============================================================================
 
-init_db()
-if not proxy_checker_started: start_proxy_checker_once()
-if not ping_service_started: start_ping_service()
-if not auto_backup_started: start_auto_backup()
+# QUAN TRỌNG: Chạy init_db() ngay khi file được import (để Gunicorn trên Render chạy nó)
+print("INFO: Đang khởi tạo Database...")
+init_db() 
 
+# Khởi động các luồng chạy nền (Proxy checker, Ping, Backup)
+if not proxy_checker_started:
+    start_proxy_checker_once() 
+if not ping_service_started:
+    start_ping_service()
+if not auto_backup_started:
+    start_auto_backup()
+
+# Logic khôi phục Proxy (chỉ chạy 1 lần khi khởi động)
 try:
-    with db() as c: 
-        p = load_selected_proxy_from_db(c)
-        if p: set_current_proxy_by_string(p)
-        else: select_best_available_proxy(c)
-except: pass
+    with db() as con_startup:
+        manual_proxy_choice = load_selected_proxy_from_db(con_startup)
+        if manual_proxy_choice:
+            print(f"INFO: Đang khôi phục proxy đã lưu: {manual_proxy_choice}")
+            is_live, latency = check_proxy_live(manual_proxy_choice)
+            if is_live:
+                set_current_proxy_by_string(manual_proxy_choice)
+                update_proxy_state(manual_proxy_choice, is_live, latency)
+            else:
+                print("WARNING: Proxy đã lưu bị chết. Đang quét lại...")
+                run_initial_proxy_scan_and_select()
+        else:
+            run_initial_proxy_scan_and_select()
+except Exception as e:
+    print(f"STARTUP ERROR (Non-critical): {e}")
 
+# Block này chỉ chạy khi bạn test trên máy tính (python app.py)
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", "8000"))
     print(f"🚀 SERVER STARTED ON PORT {port}")
     app.run(host="0.0.0.0", port=port)
